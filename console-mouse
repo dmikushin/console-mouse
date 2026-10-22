@@ -26,6 +26,11 @@ Wheel sources: a mouse wheel; TrackPoint moved with the middle button held;
 two fingers on the touchpad. Touchpad taps click like libinput's defaults:
 one finger left, two fingers right; a two-finger touchpad press is a right
 click.
+
+A touchscreen works directly: a tap clicks the touched cell (two-finger tap:
+right click), one finger dragged drags with the left button (selection,
+tmux copy mode), two fingers dragged scroll, moving the content with the
+fingers.
 """
 import fcntl
 import glob
@@ -45,10 +50,12 @@ EV_SYN, EV_KEY, EV_REL, EV_ABS = 0x00, 0x01, 0x02, 0x03
 SYN_REPORT = 0
 REL_X, REL_Y, REL_WHEEL = 0x00, 0x01, 0x08
 ABS_X, ABS_Y = 0x00, 0x01
+ABS_MT_SLOT, ABS_MT_POSITION_X, ABS_MT_POSITION_Y = 0x2F, 0x35, 0x36
+ABS_MT_TRACKING_ID = 0x39
 BTN_LEFT, BTN_RIGHT, BTN_MIDDLE = 0x110, 0x111, 0x112
 BTN_TOOL_FINGER, BTN_TOUCH = 0x145, 0x14A
 BTN_TOOL_DOUBLETAP, BTN_TOOL_TRIPLETAP, BTN_TOOL_QUADTAP = 0x14D, 0x14E, 0x14F
-INPUT_PROP_POINTER = 0x00
+INPUT_PROP_POINTER, INPUT_PROP_DIRECT = 0x00, 0x01
 KEY_LEFTCTRL, KEY_RIGHTCTRL = 29, 97
 KEY_LEFTSHIFT, KEY_RIGHTSHIFT = 42, 54
 KEY_LEFTALT = 56
@@ -79,6 +86,12 @@ MULTI_CLICK_SECONDS = 0.4
 # A touch shorter and stiller than this is a tap (libinput: 180 ms, 1.3 mm).
 TAP_SECONDS = 0.18
 TAP_MAX_MM = 1.3
+# Touchscreen: a touch shorter than this that stays within TS_TAP_CELLS of
+# where it began is a tap; two fingers moved by TS_SCROLL_ROWS rows make one
+# wheel step.
+TS_TAP_SECONDS = 0.25
+TS_TAP_CELLS = 1.0
+TS_SCROLL_ROWS = 2.0
 RESCAN_SECONDS = 5
 XTERM_MAX_CELL = 223            # X10 encoding limit: 32 + cell <= 255
 DICTATION_SOCKET = "/run/user/{uid}/nerd-dictation-ex.sock"
@@ -98,7 +111,7 @@ def bit(bits, n):
 class Device:
     def __init__(self, fd, path, pointer=None, keyboard=False, res=(1, 1)):
         self.fd, self.path = fd, path
-        self.pointer = pointer          # None, "rel" or "touchpad"
+        self.pointer = pointer          # None, "rel", "touchpad", "touchscreen"
         self.keyboard = keyboard
         self.res_x, self.res_y = res[0] or 1, res[1] or 1
         self.reset_frame()
@@ -116,6 +129,14 @@ class Device:
         self.middle_down = False
         self.middle_moved = False
         self.scroll_acc = 0.0
+        # Touchscreen: absolute ranges, contacts by MT slot, gesture state.
+        self.ranges = None              # ((min_x, max_x), (min_y, max_y))
+        self.slot = 0
+        self.contacts = set()           # slots with a finger on the screen
+        # Last position per slot. The kernel does not resend an unchanged
+        # value, so a new contact in a slot may arrive without a position.
+        self.slot_pos = {}              # slot -> [x, y]
+        self.gesture = None
 
     def reset_frame(self):
         self.dx = self.dy = 0
@@ -138,6 +159,16 @@ def probe(path):
         keyboard = bool(bit(key, KEY_C) and bit(key, KEY_LEFTCTRL))
         if bit(rel, REL_X) and bit(rel, REL_Y) and bit(key, BTN_LEFT):
             return Device(fd, path, pointer="rel", keyboard=keyboard)
+        if (bit(abs_, ABS_MT_POSITION_X) and bit(abs_, ABS_MT_POSITION_Y)
+                and bit(abs_, ABS_MT_TRACKING_ID) and bit(prop, INPUT_PROP_DIRECT)):
+            dev = Device(fd, path, pointer="touchscreen", keyboard=keyboard)
+            ranges = []
+            for axis in (ABS_MT_POSITION_X, ABS_MT_POSITION_Y):
+                info = bytearray(24)
+                fcntl.ioctl(fd, EVIOCGABS(axis), info)
+                ranges.append(struct.unpack("6i", info)[1:3])
+            dev.ranges = tuple(ranges)
+            return dev
         if (bit(abs_, ABS_X) and bit(abs_, ABS_Y)
                 and bit(key, BTN_TOOL_FINGER) and bit(prop, INPUT_PROP_POINTER)):
             res = []
@@ -515,6 +546,11 @@ class Daemon:
         con = (fd, self.console.name)
         pointer = self.pointer
 
+        if dev.pointer == "touchscreen":
+            self.touchscreen(dev, con, cols, rows, mode)
+            dev.reset_frame()
+            return
+
         dcols = drows = 0.0
         steps = dev.wheel
         if dev.pointer == "touchpad":
@@ -546,6 +582,70 @@ class Daemon:
         for btn, pressed in dev.keys:
             pointer.button(con, cols, rows, btn, pressed, mode)
         dev.reset_frame()
+
+    def touchscreen(self, dev, con, cols, rows, mode):
+        """Turn the contacts of one frame into taps, a left-button drag or
+        two-finger scrolling."""
+        pointer = self.pointer
+        (x0, x1), (y0, y1) = dev.ranges
+
+        def cell(xy):
+            col = 1 + (xy[0] - x0) * cols / (x1 - x0 + 1)
+            row = 1 + (xy[1] - y0) * rows / (y1 - y0 + 1)
+            return col, row
+
+        def goto(col, row):
+            pointer.move(con, cols, rows, col - pointer.x, row - pointer.y, mode)
+
+        points = [cell(dev.slot_pos[s]) for s in sorted(dev.contacts)
+                  if None not in dev.slot_pos.get(s, (None,))]
+        g = dev.gesture
+        now = time.monotonic()
+        if points and g is None:
+            g = dev.gesture = {"t0": now, "start": points[0], "most": 0,
+                               "moved": False, "drag": False, "acc": 0.0,
+                               "last_y": None}
+        if g is None:
+            return
+        g["most"] = max(g["most"], len(points))
+
+        if len(points) == 1 and g["most"] == 1:
+            col, row = points[0]
+            sc, sr = g["start"]
+            if abs(col - sc) > TS_TAP_CELLS or abs(row - sr) > TS_TAP_CELLS:
+                g["moved"] = True
+            if g["moved"]:
+                if not g["drag"]:
+                    goto(sc, sr)
+                    pointer.button(con, cols, rows, BTN_LEFT, True, mode)
+                    g["drag"] = True
+                goto(col, row)
+        elif len(points) >= 2:
+            if g["drag"]:
+                pointer.button(con, cols, rows, BTN_LEFT, False, mode)
+                g["drag"] = False
+            avg = sum(r for _, r in points) / len(points)
+            if g["last_y"] is not None:
+                # The content follows the fingers: moving them down shows
+                # earlier lines, which is the wheel's "up".
+                g["acc"] += avg - g["last_y"]
+                steps = int(g["acc"] / TS_SCROLL_ROWS)
+                if steps:
+                    g["acc"] -= steps * TS_SCROLL_ROWS
+                    g["moved"] = True
+                    pointer.scroll(con, cols, rows, steps, mode)
+            g["last_y"] = avg
+        elif not points:
+            if g["drag"]:
+                pointer.button(con, cols, rows, BTN_LEFT, False, mode)
+            elif not g["moved"] and now - g["t0"] < TS_TAP_SECONDS:
+                btn = {1: BTN_LEFT, 2: BTN_RIGHT}.get(g["most"])
+                if btn:
+                    if btn == BTN_LEFT:
+                        goto(*g["start"])
+                    pointer.button(con, cols, rows, btn, True, mode)
+                    pointer.button(con, cols, rows, btn, False, mode)
+            dev.gesture = None
 
     def key(self, code, value):
         if value == 0:
@@ -590,11 +690,24 @@ class Daemon:
                 dev.dy += value
             elif code == REL_WHEEL:
                 dev.wheel += value
+        elif type_ == EV_ABS and dev.pointer == "touchscreen":
+            if code == ABS_MT_SLOT:
+                dev.slot = value
+            elif code == ABS_MT_TRACKING_ID:
+                if value < 0:
+                    dev.contacts.discard(dev.slot)
+                else:
+                    dev.contacts.add(dev.slot)
+            elif code in (ABS_MT_POSITION_X, ABS_MT_POSITION_Y):
+                pos = dev.slot_pos.setdefault(dev.slot, [None, None])
+                pos[code - ABS_MT_POSITION_X] = value
         elif type_ == EV_ABS:
             if code == ABS_X:
                 dev.abs_x = value
             elif code == ABS_Y:
                 dev.abs_y = value
+        elif type_ == EV_KEY and dev.pointer == "touchscreen":
+            pass                    # BTN_TOUCH: the MT contacts say it all
         elif type_ == EV_KEY:
             if dev.pointer and code == BTN_TOUCH:
                 self.touch(dev, bool(value))

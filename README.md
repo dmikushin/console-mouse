@@ -32,6 +32,10 @@ the user who owns the console (`/run/user/<uid>/nerd-dictation-ex.sock`),
 the same toggle the middle button does under X. The middle button is never
 passed to programs.
 
+Touchscreen: a tap clicks the touched cell, a two-finger tap is a right
+click, one finger dragged drags with the left button (selection, tmux copy
+mode), and two fingers dragged scroll the content along with the fingers.
+
 Wheel sources: a mouse wheel, a TrackPoint moved with the middle button held,
 two fingers on a touchpad. A two-finger touchpad click is a right click.
 
@@ -52,8 +56,8 @@ Do not run gpm at the same time.
 sudo make test
 ```
 
-Switches to VT 12 for about 15 seconds, drives a virtual mouse, touchpad and
-keyboard through uinput, and checks what a program on that VT receives:
+Switches to VT 12 for about 15 seconds, drives a virtual mouse, touchpad,
+touchscreen and keyboard through uinput, and checks what a program on that VT receives:
 copy and paste by both chords (bracketed and not), the exact xterm report
 bytes, the Shift bypass, the dictation toggle (against a fake socket), that
 a real tmux scrolls its history with the wheel, and that the keymap is

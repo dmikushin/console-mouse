@@ -100,6 +100,74 @@ def chord(kb, *keys):
         emit(kb, (EV_KEY, k, 0))
 
 
+SCREEN_W, SCREEN_H = 1920, 1080   # touchscreen axis ranges in the test
+ABS_MT_SLOT, ABS_MT_POSITION_X, ABS_MT_POSITION_Y = 0x2F, 0x35, 0x36
+ABS_MT_TRACKING_ID = 0x39
+
+
+def touchscreen_setup(fd):
+    for ev in (EV_KEY, EV_ABS):
+        fcntl.ioctl(fd, UI_SET_EVBIT, ev)
+    fcntl.ioctl(fd, UI_SET_KEYBIT, BTN_TOUCH)
+    fcntl.ioctl(fd, UI_SET_PROPBIT, 1)      # INPUT_PROP_DIRECT
+    for axis, maximum in ((ABS_X, SCREEN_W - 1), (ABS_Y, SCREEN_H - 1),
+                          (ABS_MT_SLOT, 9), (ABS_MT_TRACKING_ID, 65535),
+                          (ABS_MT_POSITION_X, SCREEN_W - 1),
+                          (ABS_MT_POSITION_Y, SCREEN_H - 1)):
+        fcntl.ioctl(fd, UI_SET_ABSBIT, axis)
+        fcntl.ioctl(fd, UI_ABS_SETUP,
+                    struct.pack("HH6i", axis, 0, 0, 0, maximum, 0, 0, 0))
+
+
+class Touch:
+    """Multitouch (protocol B) gestures on the virtual touchscreen, aimed
+    at character cells of the VT."""
+
+    def __init__(self, fd, cols, rows):
+        self.fd, self.cols, self.rows = fd, cols, rows
+        self.tid = 100
+
+    def xy(self, col, row):
+        return (int((col - 0.5) * SCREEN_W / self.cols),
+                int((row - 0.5) * SCREEN_H / self.rows))
+
+    def down(self, slot, col, row):
+        x, y = self.xy(col, row)
+        self.tid += 1
+        return [(EV_ABS, ABS_MT_SLOT, slot), (EV_ABS, ABS_MT_TRACKING_ID, self.tid),
+                (EV_ABS, ABS_MT_POSITION_X, x), (EV_ABS, ABS_MT_POSITION_Y, y)]
+
+    def move(self, slot, col, row):
+        x, y = self.xy(col, row)
+        return [(EV_ABS, ABS_MT_SLOT, slot), (EV_ABS, ABS_MT_POSITION_X, x),
+                (EV_ABS, ABS_MT_POSITION_Y, y)]
+
+    def up(self, slot):
+        return [(EV_ABS, ABS_MT_SLOT, slot), (EV_ABS, ABS_MT_TRACKING_ID, -1)]
+
+    def tap(self, col, row):
+        emit(self.fd, *self.down(0, col, row), (EV_KEY, BTN_TOUCH, 1))
+        emit(self.fd, *self.up(0), (EV_KEY, BTN_TOUCH, 0))
+
+    def two_tap(self, col, row):
+        emit(self.fd, *self.down(0, col, row), *self.down(1, col + 3, row),
+             (EV_KEY, BTN_TOUCH, 1))
+        emit(self.fd, *self.up(0), *self.up(1), (EV_KEY, BTN_TOUCH, 0))
+
+    def drag(self, cells):
+        emit(self.fd, *self.down(0, *cells[0]), (EV_KEY, BTN_TOUCH, 1))
+        for c in cells[1:]:
+            emit(self.fd, *self.move(0, *c))
+        emit(self.fd, *self.up(0), (EV_KEY, BTN_TOUCH, 0))
+
+    def two_drag(self, col, rows):
+        emit(self.fd, *self.down(0, col, rows[0]), *self.down(1, col + 3, rows[0]),
+             (EV_KEY, BTN_TOUCH, 1))
+        for r in rows[1:]:
+            emit(self.fd, *self.move(0, col, r), *self.move(1, col + 3, r))
+        emit(self.fd, *self.up(0), *self.up(1), (EV_KEY, BTN_TOUCH, 0))
+
+
 def touchpad_setup(fd):
     for ev in (EV_KEY, EV_ABS):
         fcntl.ioctl(fd, UI_SET_EVBIT, ev)
@@ -147,6 +215,32 @@ def run_reader(mode, seconds, actions):
         time.sleep(0.1)
     time.sleep(0.1)
     return open(out, "rb").read()
+
+
+def touchscreen(ts):
+    """Tap = click at the touched cell; two-finger tap = right click; one
+    finger dragged = left-button drag; two fingers dragged down 5 rows = 2
+    wheel steps up (the content follows the fingers)."""
+    vt = f"/dev/tty{VT}"
+    rows, cols, _, _ = struct.unpack(
+        "4H", fcntl.ioctl(os.open(vt, os.O_RDONLY | os.O_NOCTTY), 0x5413, bytes(8)))
+    touch = Touch(ts, cols, rows)
+
+    def gestures():
+        touch.tap(10, 5)
+        time.sleep(0.5)             # not a double click
+        touch.two_tap(20, 6)
+        time.sleep(0.5)
+        touch.drag([(5, 3), (6, 3), (7, 3), (8, 3)])
+        touch.two_drag(30, [10, 11, 12, 13, 14, 15])
+
+    got = run_reader("report", 4.0, gestures)
+    expected = (r(0, 10, 5) + r(3, 10, 5)              # tap
+                + r(2, 10, 5) + r(3, 10, 5)            # two-finger tap
+                + r(0, 5, 3) + r(32, 7, 3) + r(32, 8, 3) + r(3, 8, 3)  # drag
+                + r(64, 8, 3) * 2)                     # two-finger scroll
+    return check("touchscreen: tap, two-finger tap, drag, two-finger scroll",
+                 got, expected)
 
 
 def r(code, col, row):
@@ -207,6 +301,7 @@ def main():
     keymap_before = keymap_entries()
     m = uinput("console-mouse test mouse", mouse_setup)
     tp = uinput("console-mouse test touchpad", touchpad_setup)
+    ts = uinput("console-mouse test touchscreen", touchscreen_setup)
     kb = uinput("console-mouse test keyboard", keyboard_setup)
     commands, close_dictation = fake_dictation()
     time.sleep(0.3)
@@ -294,6 +389,7 @@ def main():
         failures += check("middle click toggles nerd-dictation",
                           json.dumps(commands).encode(),
                           b'[{"action": "toggle"}]')
+        failures += touchscreen(ts)
         failures += tmux_scroll(m)
     finally:
         daemon.terminate()
@@ -302,7 +398,7 @@ def main():
                           str(keymap_entries()).encode(),
                           str(keymap_before).encode())
         subprocess.run(["chvt", original])
-        for fd in (m, tp, kb):
+        for fd in (m, tp, kb, ts):
             fcntl.ioctl(fd, UI_DEV_DESTROY)
         close_dictation()
         if service:
