@@ -1,0 +1,356 @@
+#!/usr/bin/python3
+"""End-to-end test of console-mouse on a real VT. Run as root.
+
+Briefly switches to a spare VT, runs a raw-mode reader there, drives a virtual
+mouse, touchpad and keyboard through uinput, and checks what arrives:
+  1. no mouse reporting: drag-select + Ctrl+Shift+C/V, double-click word +
+     Alt+C/V paste exactly the selected text, and nothing else (the chords
+     are voided in the keymap); with DECSET 2004 the paste is bracketed;
+  2. DECSET 1000 (what tmux sends): wheel, click, drag, TrackPoint middle
+     scroll, touchpad two-finger scroll and one/two-finger taps arrive as
+     xterm X10 reports; the
+     middle button is not reported; Shift+drag selects instead of reporting;
+  3. a middle click sends {"action": "toggle"} to the console owner's
+     nerd-dictation socket (a fake one here); the clipboard is not pasted
+     into a console of another user;
+  4. a real tmux scrolls its history with the wheel;
+  5. the console keymap is restored when the daemon stops.
+Then switches back to the original VT.
+"""
+import fcntl
+import json
+import os
+import pwd
+import socket
+import threading
+import struct
+import subprocess
+import sys
+import tempfile
+import time
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+DAEMON = os.path.join(HERE, "..", "console-mouse")
+VT = 12
+
+EV_SYN, EV_KEY, EV_REL, EV_ABS = 0, 1, 2, 3
+REL_X, REL_Y, REL_WHEEL = 0, 1, 8
+ABS_X, ABS_Y = 0, 1
+BTN_LEFT, BTN_RIGHT, BTN_MIDDLE = 0x110, 0x111, 0x112
+BTN_TOOL_FINGER, BTN_TOUCH, BTN_TOOL_DOUBLETAP = 0x145, 0x14A, 0x14D
+KEY_LEFTCTRL, KEY_LEFTSHIFT, KEY_LEFTALT, KEY_C, KEY_V = 29, 42, 56, 46, 47
+# Owner of the test VT for the middle click: the daemon's dictation client
+# runs as this user, so it must exist.
+FAKE_UID = pwd.getpwnam("nobody").pw_uid
+UI_SET_EVBIT, UI_SET_KEYBIT, UI_SET_RELBIT = 0x40045564, 0x40045565, 0x40045566
+UI_SET_ABSBIT, UI_SET_PROPBIT = 0x40045567, 0x4004556E
+UI_DEV_SETUP, UI_ABS_SETUP = 0x405C5503, 0x401C5504
+UI_DEV_CREATE, UI_DEV_DESTROY = 0x5501, 0x5502
+EVENT = struct.Struct("llHHi")
+
+READER = r"""
+import os, sys, termios, tty, time, select
+mode, out, seconds = sys.argv[1], sys.argv[2], float(sys.argv[3])
+fd = sys.stdin.fileno()
+tty.setraw(fd)
+# Modes a previous program (tmux) may have left on this VT: reset them.
+os.write(1, b"\033[?1000l\033[?2004l\033[H\033[2JHELLO WORLD\r\n")
+if mode == "report":
+    os.write(1, b"\033[?1000h")
+if mode == "bracketed":
+    os.write(1, b"\033[?2004h")
+got = b""
+end = time.time() + seconds
+while time.time() < end:
+    if select.select([fd], [], [], 0.05)[0]:
+        got += os.read(fd, 1024)
+os.write(1, b"\033[?1000l\033[?2004l")
+open(out, "wb").write(got)
+"""
+
+
+def uinput(name, setup):
+    fd = os.open("/dev/uinput", os.O_WRONLY | os.O_NONBLOCK)
+    setup(fd)
+    fcntl.ioctl(fd, UI_DEV_SETUP, struct.pack("4H80sI", 3, 1, 1, 1,
+                                              name.encode(), 0))
+    fcntl.ioctl(fd, UI_DEV_CREATE)
+    return fd
+
+
+def mouse_setup(fd):
+    for ev in (EV_KEY, EV_REL):
+        fcntl.ioctl(fd, UI_SET_EVBIT, ev)
+    for b in (BTN_LEFT, BTN_RIGHT, BTN_MIDDLE):
+        fcntl.ioctl(fd, UI_SET_KEYBIT, b)
+    for r in (REL_X, REL_Y, REL_WHEEL):
+        fcntl.ioctl(fd, UI_SET_RELBIT, r)
+
+
+def keyboard_setup(fd):
+    fcntl.ioctl(fd, UI_SET_EVBIT, EV_KEY)
+    for k in (KEY_LEFTCTRL, KEY_LEFTSHIFT, KEY_LEFTALT, KEY_C, KEY_V):
+        fcntl.ioctl(fd, UI_SET_KEYBIT, k)
+
+
+def chord(kb, *keys):
+    for k in keys:
+        emit(kb, (EV_KEY, k, 1))
+    for k in reversed(keys):
+        emit(kb, (EV_KEY, k, 0))
+
+
+def touchpad_setup(fd):
+    for ev in (EV_KEY, EV_ABS):
+        fcntl.ioctl(fd, UI_SET_EVBIT, ev)
+    for b in (BTN_LEFT, BTN_TOOL_FINGER, BTN_TOUCH, BTN_TOOL_DOUBLETAP):
+        fcntl.ioctl(fd, UI_SET_KEYBIT, b)
+    fcntl.ioctl(fd, UI_SET_PROPBIT, 0)      # INPUT_PROP_POINTER
+    for axis, maximum in ((ABS_X, 2000), (ABS_Y, 1300)):
+        fcntl.ioctl(fd, UI_SET_ABSBIT, axis)
+        fcntl.ioctl(fd, UI_ABS_SETUP,
+                    struct.pack("HH6i", axis, 0, 0, 0, maximum, 0, 0, 20))
+
+
+def emit(fd, *events):
+    for type_, code, value in events:
+        os.write(fd, EVENT.pack(0, 0, type_, code, value))
+    os.write(fd, EVENT.pack(0, 0, EV_SYN, 0, 0))
+    time.sleep(0.05)
+
+
+def home(m):
+    """Pointer to cell (1, 1): huge negative motion is clamped."""
+    emit(m, (EV_REL, REL_X, -100000), (EV_REL, REL_Y, -100000))
+
+
+def goto(m, col, row):
+    home(m)
+    emit(m, (EV_REL, REL_X, (col - 1) * 8), (EV_REL, REL_Y, (row - 1) * 16))
+
+
+def click(m, btn):
+    emit(m, (EV_KEY, btn, 1))
+    emit(m, (EV_KEY, btn, 0))
+
+
+def run_reader(mode, seconds, actions):
+    out = tempfile.mktemp()
+    script = tempfile.mktemp(suffix=".py")
+    open(script, "w").write(READER)
+    subprocess.run(["openvt", "-c", str(VT), "-f", "--", "python3", script,
+                    mode, out, str(seconds)], check=True)
+    subprocess.run(["chvt", str(VT)], check=True)
+    time.sleep(0.5)
+    actions()
+    while not os.path.exists(out):
+        time.sleep(0.1)
+    time.sleep(0.1)
+    return open(out, "rb").read()
+
+
+def r(code, col, row):
+    return b"\033[M" + bytes([32 + code, 32 + col, 32 + row])
+
+
+def keymap_entries():
+    fd = os.open("/dev/tty0", os.O_RDONLY | os.O_NOCTTY)
+    out = []
+    for table in (5, 7, 8, 10):
+        for key in (KEY_C, KEY_V):
+            buf = bytearray(struct.pack("BBH", table, key, 0))
+            fcntl.ioctl(fd, 0x4B46, buf)        # KDGKBENT
+            out.append(struct.unpack("BBH", buf)[2])
+    os.close(fd)
+    return out
+
+
+def fake_dictation():
+    """A stand-in for nerd-dictation's daemon socket; returns received
+    commands."""
+    rundir = f"/run/user/{FAKE_UID}"
+    os.makedirs(rundir, exist_ok=True)
+    os.chown(rundir, FAKE_UID, -1)
+    path = f"{rundir}/nerd-dictation-ex.sock"
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    server.bind(path)
+    os.chown(path, FAKE_UID, -1)
+    server.listen()
+    commands = []
+
+    def serve():
+        while True:
+            try:
+                client, _ = server.accept()
+            except OSError:
+                return
+            commands.append(json.loads(client.recv(4096)))
+            client.send(b'{"status": "ok"}')
+            client.close()
+
+    threading.Thread(target=serve, daemon=True).start()
+
+    def close():
+        server.close()
+        os.unlink(path)
+        os.rmdir(rundir)
+    return commands, close
+
+
+def main():
+    original = open("/sys/class/tty/tty0/active").read().strip()[3:]
+    # An installed daemon would answer the same events a second time.
+    service = subprocess.run(["systemctl", "is-active", "--quiet",
+                              "console-mouse"]).returncode == 0
+    if service:
+        subprocess.run(["systemctl", "stop", "console-mouse"], check=True)
+    keymap_before = keymap_entries()
+    m = uinput("console-mouse test mouse", mouse_setup)
+    tp = uinput("console-mouse test touchpad", touchpad_setup)
+    kb = uinput("console-mouse test keyboard", keyboard_setup)
+    commands, close_dictation = fake_dictation()
+    time.sleep(0.3)
+    daemon = subprocess.Popen([sys.executable, DAEMON])
+    time.sleep(0.5)
+    failures = 0
+    try:
+        def copy_paste():
+            goto(m, 1, 1)                        # drag-select "HELLO"
+            emit(m, (EV_KEY, BTN_LEFT, 1))
+            emit(m, (EV_REL, REL_X, 4 * 8))
+            emit(m, (EV_KEY, BTN_LEFT, 0))
+            chord(kb, KEY_LEFTCTRL, KEY_LEFTSHIFT, KEY_C)
+            chord(kb, KEY_LEFTCTRL, KEY_LEFTSHIFT, KEY_V)
+            goto(m, 9, 1)                        # double-click "WORLD"
+            click(m, BTN_LEFT)
+            click(m, BTN_LEFT)
+            chord(kb, KEY_LEFTALT, KEY_C)
+            chord(kb, KEY_LEFTALT, KEY_V)
+            goto(m, 1, 1)                        # click clears the selection,
+            click(m, BTN_LEFT)                   # copy keeps the clipboard
+            time.sleep(0.5)
+            chord(kb, KEY_LEFTCTRL, KEY_LEFTSHIFT, KEY_C)
+            chord(kb, KEY_LEFTCTRL, KEY_LEFTSHIFT, KEY_V)
+
+        got = run_reader("plain", 3.5, copy_paste)
+        failures += check("select + Ctrl+Shift+C/V, Alt+C/V",
+                          got, b"HELLOWORLDWORLD")
+
+        got = run_reader("bracketed", 1.5,
+                         lambda: chord(kb, KEY_LEFTALT, KEY_V))
+        failures += check("bracketed paste",
+                          got, b"\033[200~WORLD\033[201~")
+
+        def reports():
+            goto(m, 3, 2)
+            emit(m, (EV_REL, REL_WHEEL, 1))
+            emit(m, (EV_REL, REL_WHEEL, -1))
+            click(m, BTN_LEFT)
+            emit(m, (EV_KEY, BTN_LEFT, 1))
+            emit(m, (EV_REL, REL_X, 8))          # drag to column 4
+            emit(m, (EV_KEY, BTN_LEFT, 0))
+            emit(m, (EV_KEY, BTN_MIDDLE, 1))     # TrackPoint scroll: 2 down
+            emit(m, (EV_REL, REL_Y, 24))
+            emit(m, (EV_KEY, BTN_MIDDLE, 0))
+            # Touchpad: two fingers 6 mm up = 2 steps up (pointer stays).
+            emit(tp, (EV_KEY, BTN_TOUCH, 1), (EV_KEY, BTN_TOOL_DOUBLETAP, 1),
+                 (EV_ABS, ABS_X, 1000), (EV_ABS, ABS_Y, 600))
+            emit(tp, (EV_ABS, ABS_Y, 540))
+            emit(tp, (EV_ABS, ABS_Y, 480))
+            emit(tp, (EV_KEY, BTN_TOUCH, 0), (EV_KEY, BTN_TOOL_DOUBLETAP, 0))
+            # Taps: one finger = left click, two fingers = right click.
+            for tool in (BTN_TOOL_FINGER, BTN_TOOL_DOUBLETAP):
+                emit(tp, (EV_KEY, BTN_TOUCH, 1), (EV_KEY, tool, 1),
+                     (EV_ABS, ABS_X, 1000), (EV_ABS, ABS_Y, 600))
+                emit(tp, (EV_KEY, BTN_TOUCH, 0), (EV_KEY, tool, 0))
+            # Shift+drag selects "HELLO" instead of reporting; then paste it.
+            goto(m, 1, 1)
+            emit(kb, (EV_KEY, KEY_LEFTSHIFT, 1))
+            emit(m, (EV_KEY, BTN_LEFT, 1))
+            emit(m, (EV_REL, REL_X, 4 * 8))
+            emit(m, (EV_KEY, BTN_LEFT, 0))
+            emit(kb, (EV_KEY, KEY_LEFTSHIFT, 0))
+            chord(kb, KEY_LEFTALT, KEY_C)
+            chord(kb, KEY_LEFTALT, KEY_V)
+            # Still middle click: dictation toggle, not a report.
+            os.chown(f"/dev/tty{VT}", FAKE_UID, -1)
+            click(m, BTN_MIDDLE)
+            time.sleep(0.5)
+            # The VT now belongs to another user: the clipboard copied while
+            # it was root's must not be pasted into it.
+            chord(kb, KEY_LEFTALT, KEY_V)
+
+        got = run_reader("report", 4.0, reports)
+        expected = (r(64, 3, 2) + r(65, 3, 2)          # wheel up, down
+                    + r(0, 3, 2) + r(3, 3, 2)          # left click
+                    + r(0, 3, 2) + r(32, 4, 2) + r(3, 4, 2)  # drag
+                    + r(65, 4, 2) * 2                  # middle-button scroll
+                    + r(64, 4, 2) * 2                  # two-finger scroll
+                    + r(0, 4, 2) + r(3, 4, 2)          # one-finger tap
+                    + r(2, 4, 2) + r(3, 4, 2)          # two-finger tap
+                    + b"HELLO")                        # Shift+drag, Alt+C/V
+        failures += check("xterm reports (tmux mouse), Shift bypass",
+                          got, expected)
+        failures += check("middle click toggles nerd-dictation",
+                          json.dumps(commands).encode(),
+                          b'[{"action": "toggle"}]')
+        failures += tmux_scroll(m)
+    finally:
+        daemon.terminate()
+        daemon.wait()
+        failures += check("keymap restored on stop",
+                          str(keymap_entries()).encode(),
+                          str(keymap_before).encode())
+        subprocess.run(["chvt", original])
+        for fd in (m, tp, kb):
+            fcntl.ioctl(fd, UI_DEV_DESTROY)
+        close_dictation()
+        if service:
+            subprocess.run(["systemctl", "start", "console-mouse"])
+    sys.exit(1 if failures else 0)
+
+
+def tmux_scroll(m):
+    """A real tmux with "mouse on" on the VT. tmux's default bindings: the
+    first WheelUpPane only enters copy mode, each further wheel step scrolls
+    5 lines. So 3 steps up = 10 lines back, then 1 step down = 5."""
+    conf = tempfile.mktemp()
+    open(conf, "w").write("set -g mouse on\n")
+    tmux = ["tmux", "-L", "console-mouse-test", "-f", conf]
+    log = tempfile.mktemp()
+    # A VT login has TERM=linux; openvt passes on ours, which may be unset.
+    subprocess.run(["openvt", "-c", str(VT), "-f", "--", "sh", "-c",
+                    'TERM=linux exec "$@" 2>"$0"', log, *tmux, "new-session",
+                    "seq 1 500; sleep 30"], check=True)
+    subprocess.run(["chvt", str(VT)], check=True)
+    time.sleep(1.5)
+    try:
+        goto(m, 10, 10)
+        position = lambda: subprocess.run(
+            [*tmux, "display", "-p", "#{pane_in_mode} #{scroll_position}"],
+            capture_output=True, text=True).stdout.strip()
+        for _ in range(3):
+            emit(m, (EV_REL, REL_WHEEL, 1))
+        time.sleep(0.5)
+        got = position()
+        emit(m, (EV_REL, REL_WHEEL, -1))
+        time.sleep(0.5)
+        got += " / " + position()
+    finally:
+        subprocess.run([*tmux, "kill-server"], capture_output=True)
+    if os.path.exists(log) and os.path.getsize(log):
+        print("  tmux stderr:", open(log).read().strip())
+    return check("real tmux: wheel scrolls the pane history",
+                 got.encode(), b"1 10 / 1 5")
+
+
+def check(name, got, expected):
+    ok = got == expected
+    print(f"{'PASS' if ok else 'FAIL'}: {name}")
+    if not ok:
+        print(f"  expected {expected!r}\n  got      {got!r}")
+    return 0 if ok else 1
+
+
+if __name__ == "__main__":
+    main()

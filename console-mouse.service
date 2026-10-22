@@ -1,0 +1,9 @@
+[Unit]
+Description=Mouse on the text console (pointer, selection, xterm reports for tmux)
+
+[Service]
+ExecStart=/usr/local/bin/console-mouse
+Restart=always
+
+[Install]
+WantedBy=multi-user.target

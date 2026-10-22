@@ -1,0 +1,692 @@
+#!/usr/bin/python3
+"""Mouse on the Linux text console, including wheel scrolling in tmux.
+
+gpm never forwards the wheel to programs, and the kernel's own mouse report
+(TIOCL_SELMOUSEREPORT) can encode buttons 0-15 only, while the xterm wheel
+codes are 64/65. This daemon reads the pointing devices (mice, TrackPoint,
+touchpad) and the keyboards through evdev and, while the foreground VT is in
+text mode (KD_TEXT, i.e. not X):
+
+  * draws the pointer (TIOCL_SELPOINTER);
+  * if the program on the console asked for mouse reports (DECSET 9/1000,
+    read back with TIOCL_GETMOUSEREPORTING), injects xterm X10-encoded
+    reports into the tty input with TIOCSTI: left/right presses, releases,
+    drag motion and the wheel - what tmux "set -g mouse on" understands.
+    Shift held bypasses the program and selects, as in xterm;
+  * otherwise selects with the left button (double click: words, triple:
+    lines; right click extends), highlighted by the kernel (TIOCL_SETSEL);
+  * Ctrl+Shift+C or Alt+C copies the selection, Ctrl+Shift+V or Alt+V pastes
+    it (bracketed if the program enabled DECSET 2004). These four chords are
+    voided in the console keymap so the program does not also get ^C, ^V,
+    ESC c or ESC v;
+  * a middle click toggles nerd-dictation (its daemon's socket), as the
+    middle button does under X; the middle button is not passed on.
+
+Wheel sources: a mouse wheel; TrackPoint moved with the middle button held;
+two fingers on the touchpad. Touchpad taps click like libinput's defaults:
+one finger left, two fingers right; a two-finger touchpad press is a right
+click.
+"""
+import fcntl
+import glob
+import math
+import os
+import pwd
+import select
+import signal
+import struct
+import subprocess
+import sys
+import time
+import traceback
+
+EVENT = struct.Struct("llHHi")
+EV_SYN, EV_KEY, EV_REL, EV_ABS = 0x00, 0x01, 0x02, 0x03
+SYN_REPORT = 0
+REL_X, REL_Y, REL_WHEEL = 0x00, 0x01, 0x08
+ABS_X, ABS_Y = 0x00, 0x01
+BTN_LEFT, BTN_RIGHT, BTN_MIDDLE = 0x110, 0x111, 0x112
+BTN_TOOL_FINGER, BTN_TOUCH = 0x145, 0x14A
+BTN_TOOL_DOUBLETAP, BTN_TOOL_TRIPLETAP, BTN_TOOL_QUADTAP = 0x14D, 0x14E, 0x14F
+INPUT_PROP_POINTER = 0x00
+KEY_LEFTCTRL, KEY_RIGHTCTRL = 29, 97
+KEY_LEFTSHIFT, KEY_RIGHTSHIFT = 42, 54
+KEY_LEFTALT = 56
+KEY_C, KEY_V = 46, 47
+CTRL, SHIFT = {KEY_LEFTCTRL, KEY_RIGHTCTRL}, {KEY_LEFTSHIFT, KEY_RIGHTSHIFT}
+
+EVIOCGBIT = lambda ev, size: 0x80004520 | (size << 16) | ev
+EVIOCGPROP = 0x80044509
+EVIOCGABS = lambda axis: 0x80184540 + axis
+KDGETMODE, KD_TEXT = 0x4B3B, 0x00
+KDGKBENT, KDSKBENT = 0x4B46, 0x4B47
+TIOCLINUX, TIOCSTI, TIOCGWINSZ = 0x541C, 0x5412, 0x5413
+TIOCL_SETSEL, TIOCL_GETMOUSEREPORTING, TIOCL_GETBRACKETEDPASTE = 2, 7, 18
+SEL_CHAR, SEL_WORD, SEL_LINE, SEL_POINTER, SEL_CLEAR = 0, 1, 2, 3, 4
+
+# Keymap tables (modifier bit sets: shift 1, altgr 2, control 4, alt 8) whose
+# C and V entries are voided. AltGr is the Cyrillic lock of ruwin_cplk.
+K_HOLE = 0x0200
+VOIDED_TABLES = (4 | 1, 4 | 1 | 2, 8, 8 | 2)
+
+# Pointer speed in character cells.
+REL_COLS_PER_COUNT, REL_ROWS_PER_COUNT = 1 / 8, 1 / 16
+TP_COLS_PER_MM, TP_ROWS_PER_MM = 1.4, 0.7
+# Distance per emitted wheel step.
+REL_SCROLL_COUNTS = 12          # TrackPoint with the middle button held
+TP_SCROLL_MM = 3.0              # two fingers on the touchpad
+MULTI_CLICK_SECONDS = 0.4
+# A touch shorter and stiller than this is a tap (libinput: 180 ms, 1.3 mm).
+TAP_SECONDS = 0.18
+TAP_MAX_MM = 1.3
+RESCAN_SECONDS = 5
+XTERM_MAX_CELL = 223            # X10 encoding limit: 32 + cell <= 255
+DICTATION_SOCKET = "/run/user/{uid}/nerd-dictation-ex.sock"
+
+BUTTON_CODE = {BTN_LEFT: 0, BTN_MIDDLE: 1, BTN_RIGHT: 2}
+WHEEL_UP, WHEEL_DOWN, RELEASE = 64, 65, 3
+
+
+def log(*args):
+    print(*args, flush=True)
+
+
+def bit(bits, n):
+    return bits[n // 8] >> (n % 8) & 1
+
+
+class Device:
+    def __init__(self, fd, path, pointer=None, keyboard=False, res=(1, 1)):
+        self.fd, self.path = fd, path
+        self.pointer = pointer          # None, "rel" or "touchpad"
+        self.keyboard = keyboard
+        self.res_x, self.res_y = res[0] or 1, res[1] or 1
+        self.reset_frame()
+        # Touchpad tracking.
+        self.abs_x = self.abs_y = None
+        self.last_x = self.last_y = None
+        self.touching = False
+        self.fingers = 0
+        self.touch_start = 0.0
+        self.tap_fingers = 0        # most fingers seen during this touch
+        self.tap_travel = 0.0       # mm moved during this touch
+        self.tap_clicked = False    # the pad was pressed: not a tap
+        self.pressed_as = {}        # evdev button -> button it acted as
+        # Middle button: scrolls while moved (TrackPoint), clicks when still.
+        self.middle_down = False
+        self.middle_moved = False
+        self.scroll_acc = 0.0
+
+    def reset_frame(self):
+        self.dx = self.dy = 0
+        self.wheel = 0
+        self.keys = []
+
+
+def probe(path):
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+    except OSError:
+        return None
+    try:
+        key, rel, abs_, prop = (bytearray(96), bytearray(8), bytearray(8),
+                                bytearray(4))
+        fcntl.ioctl(fd, EVIOCGBIT(EV_KEY, len(key)), key)
+        fcntl.ioctl(fd, EVIOCGBIT(EV_REL, len(rel)), rel)
+        fcntl.ioctl(fd, EVIOCGBIT(EV_ABS, len(abs_)), abs_)
+        fcntl.ioctl(fd, EVIOCGPROP, prop)
+        keyboard = bool(bit(key, KEY_C) and bit(key, KEY_LEFTCTRL))
+        if bit(rel, REL_X) and bit(rel, REL_Y) and bit(key, BTN_LEFT):
+            return Device(fd, path, pointer="rel", keyboard=keyboard)
+        if (bit(abs_, ABS_X) and bit(abs_, ABS_Y)
+                and bit(key, BTN_TOOL_FINGER) and bit(prop, INPUT_PROP_POINTER)):
+            res = []
+            for axis in (ABS_X, ABS_Y):
+                info = bytearray(24)
+                fcntl.ioctl(fd, EVIOCGABS(axis), info)
+                res.append(struct.unpack("6i", info)[5])
+            return Device(fd, path, pointer="touchpad", keyboard=keyboard,
+                          res=res)
+        if keyboard:
+            return Device(fd, path, keyboard=True)
+    except OSError:
+        pass
+    os.close(fd)
+    return None
+
+
+class Keymap:
+    """Void Ctrl+Shift+C/V and Alt+C/V in the console keymap (global to all
+    VTs); restore the original entries on exit. Re-applied if something
+    reloads the keymap (loadkeys, systemd-vconsole-setup)."""
+
+    def __init__(self):
+        self.fd = os.open("/dev/tty0", os.O_RDONLY | os.O_NOCTTY)
+        self.saved = {}
+        for table in VOIDED_TABLES:
+            for keycode in (KEY_C, KEY_V):
+                value = self.get(table, keycode)
+                self.saved[table, keycode] = value if value != K_HOLE else None
+
+    def get(self, table, keycode):
+        buf = bytearray(struct.pack("BBH", table, keycode, 0))
+        fcntl.ioctl(self.fd, KDGKBENT, buf)
+        return struct.unpack("BBH", buf)[2]
+
+    def set(self, table, keycode, value):
+        fcntl.ioctl(self.fd, KDSKBENT, struct.pack("BBH", table, keycode, value))
+
+    def apply(self):
+        for (table, keycode), saved in self.saved.items():
+            value = self.get(table, keycode)
+            if value != K_HOLE:
+                self.saved[table, keycode] = value   # keymap was reloaded
+                self.set(table, keycode, K_HOLE)
+
+    def restore(self):
+        for (table, keycode), saved in self.saved.items():
+            if saved is not None:
+                self.set(table, keycode, saved)
+
+
+class Console:
+    """The foreground VT, reopened when it changes or gets hung up."""
+
+    def __init__(self):
+        self.name = None
+        self.fd = None
+
+    def close(self):
+        if self.fd is not None:
+            os.close(self.fd)
+        self.fd = self.name = None
+
+    def _query(self):
+        with open("/sys/class/tty/tty0/active") as f:
+            name = "/dev/" + f.read().strip()
+        if name != self.name:
+            self.close()
+            self.fd = os.open(name, os.O_RDWR | os.O_NOCTTY)
+            self.name = name
+        mode = bytearray(4)
+        fcntl.ioctl(self.fd, KDGETMODE, mode)
+        if struct.unpack("i", mode)[0] != KD_TEXT:
+            return None
+        return (self.fd, *size(self.fd), tioclinux_get(self.fd,
+                                                      TIOCL_GETMOUSEREPORTING))
+
+    def state(self):
+        """(fd, cols, rows, mouse reporting mode) of the foreground VT if it
+        is in text mode, else None. A new session on a VT calls vhangup(),
+        which kills our cached fd (EIO): reopen and ask again."""
+        try:
+            return self._query()
+        except OSError:
+            self.close()
+            return self._query()
+
+
+def size(fd):
+    rows, cols, _, _ = struct.unpack("4H", fcntl.ioctl(fd, TIOCGWINSZ, bytes(8)))
+    return cols, rows
+
+
+def tioclinux_get(fd, subcode):
+    buf = bytearray([subcode])
+    fcntl.ioctl(fd, TIOCLINUX, buf)
+    return buf[0]
+
+
+def setsel(fd, xs, ys, xe, ye, mode):
+    fcntl.ioctl(fd, TIOCLINUX, struct.pack("<B5H", TIOCL_SETSEL,
+                                           xs, ys, xe, ye, mode))
+
+
+def inject(fd, data):
+    for byte in data:
+        fcntl.ioctl(fd, TIOCSTI, bytes([byte]))
+
+
+def report(fd, code, col, row):
+    inject(fd, b"\033[M" + bytes([32 + code, 32 + min(col, XTERM_MAX_CELL),
+                                  32 + min(row, XTERM_MAX_CELL)]))
+
+
+def screen(console_name, cols, rows):
+    """The characters of a VT, from /dev/vcsuN (one native-endian UTF-32 cell
+    per character), or None if the read comes back short."""
+    need = cols * rows * 4
+    data = b""
+    with open(console_name.replace("/dev/tty", "/dev/vcsu"), "rb") as f:
+        while len(data) < need:
+            chunk = f.read(need - len(data))
+            if not chunk:
+                return None
+            data += chunk
+    return list(data.decode(f"utf-32-{sys.byteorder[0]}e", errors="replace"))
+
+
+# Characters that belong to a word for double-click selection: the kernel's
+# default inwordLut (0-9 A-Z a-z - . / _) plus everything beyond ASCII.
+WORD_CHARS = set("-./_0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+                 "abcdefghijklmnopqrstuvwxyz")
+
+
+def selected_text(chars, cols, start, end, mode):
+    """The text the kernel highlights for a selection between two cells
+    (0-based linear indices), with the kernel's word/line expansion and its
+    trailing-blank stripping; line breaks are '\\r', as a paste sends them."""
+    inword = lambda c: c in WORD_CHARS or ord(c) > 0x7F
+    space = lambda i: chars[i] == " "
+    atedge = lambda i: i % cols == 0 or (i + 1) % cols == 0
+    if start > end:
+        start, end = end, start
+    if mode == SEL_WORD:
+        spc = space(start)
+        i = start
+        while True:
+            if (space(i) if spc else inword(chars[i])) is False:
+                break
+            start = i
+            if i % cols == 0:
+                break
+            i -= 1
+        spc = space(end)
+        i = end
+        while True:
+            if (space(i) if spc else inword(chars[i])) is False:
+                break
+            end = i
+            if (i + 1) % cols == 0:
+                break
+            i += 1
+    elif mode == SEL_LINE:
+        start -= start % cols
+        end = end - end % cols + cols - 1
+    if end > start and not atedge(end) and space(end):
+        i = end + 1
+        while space(i) and not atedge(i):
+            i += 1
+        if space(i):
+            end = i
+    out, kept = [], 0
+    for i in range(start, end + 1):
+        out.append(chars[i])
+        if chars[i] != " ":
+            kept = len(out)
+        if (i + 1) % cols == 0:
+            if kept != len(out):
+                del out[kept:]
+                out.append("\r")
+            kept = len(out)
+    return "".join(out)
+
+
+# Sends nerd-dictation's own "toggle" command; its reply goes to the journal.
+DICTATION_CLIENT = """
+import json, socket, sys
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.settimeout(10)
+try:
+    s.connect(sys.argv[1])
+    s.send(json.dumps({"action": "toggle"}).encode())
+    print("middle click: nerd-dictation", s.recv(4096).decode(errors="replace"))
+except OSError as e:
+    print(f"middle click: nerd-dictation: {sys.argv[1]}: {e}")
+"""
+
+
+class Dictation:
+    """Toggles the nerd-dictation daemon of the user who owns the console.
+    The socket lives in a directory that user controls, so the client runs
+    as that user, never as root, and only one request is in flight."""
+
+    def __init__(self):
+        self.child = None
+
+    def toggle(self, uid):
+        if uid == 0:
+            return                  # login prompt or root console
+        if self.child and self.child.poll() is None:
+            log("middle click: previous nerd-dictation toggle still pending")
+            return
+        user = pwd.getpwuid(uid)
+        self.child = subprocess.Popen(
+            [sys.executable, "-c", DICTATION_CLIENT,
+             DICTATION_SOCKET.format(uid=uid)],
+            user=uid, group=user.pw_gid, extra_groups=[], env={},
+            stdin=subprocess.DEVNULL, start_new_session=True)
+
+
+class Pointer:
+    def __init__(self):
+        self.x = self.y = 1.0
+        self.held = set()           # buttons held, as BTN_* codes
+        self.anchor = (1, 1)
+        self.sel_mode = SEL_CHAR
+        self.last_click = (0.0, None)
+        self.clicks = 0
+        self.drawn = None
+        self.selection = ("", None)  # (text highlighted, VT it is on)
+        self.clipboard = ("", None)  # (text, uid owning the VT it came from)
+        self.dictation = Dictation()
+
+    def cell(self, cols, rows):
+        self.x = min(max(self.x, 1.0), cols + 0.999)
+        self.y = min(max(self.y, 1.0), rows + 0.999)
+        return int(self.x), int(self.y)
+
+    def select(self, con, cols, rows, col, row):
+        fd, name = con
+        setsel(fd, *self.anchor, col, row, self.sel_mode)
+        lin = lambda c, r: (r - 1) * cols + (c - 1)
+        chars = screen(name, cols, rows)
+        text = chars and selected_text(chars, cols, lin(*self.anchor),
+                                       lin(col, row), self.sel_mode)
+        self.selection = (text or "", name)
+
+    def move(self, con, cols, rows, dcols, drows, mode):
+        fd = con[0]
+        before = self.cell(cols, rows)
+        self.x += dcols
+        self.y += drows
+        col, row = self.cell(cols, rows)
+        if (col, row) == before:
+            if self.drawn != (fd, col, row):
+                self.draw(fd, col, row)
+            return
+        reported = self.held - {BTN_MIDDLE}
+        if mode == 2 and reported:
+            report(fd, 32 + BUTTON_CODE[min(reported)], col, row)
+        elif mode == 0 and BTN_LEFT in self.held:
+            self.select(con, cols, rows, col, row)
+        self.draw(fd, col, row)
+
+    def draw(self, fd, col, row):
+        setsel(fd, col, row, col, row, SEL_POINTER)
+        self.drawn = (fd, col, row)
+
+    def button(self, con, cols, rows, btn, pressed, mode):
+        fd, name = con
+        col, row = self.cell(cols, rows)
+        if pressed:
+            self.held.add(btn)
+        else:
+            self.held.discard(btn)
+        if btn == BTN_MIDDLE:
+            if pressed:
+                self.dictation.toggle(os.stat(name).st_uid)
+            return
+        if mode:
+            if pressed:
+                report(fd, BUTTON_CODE[btn], col, row)
+            elif mode == 2:
+                report(fd, RELEASE, col, row)
+            return
+        if not pressed:
+            return
+        if btn == BTN_LEFT:
+            now = time.monotonic()
+            last_time, last_cell = self.last_click
+            if now - last_time < MULTI_CLICK_SECONDS and last_cell == (col, row):
+                self.clicks = self.clicks % 3 + 1
+            else:
+                self.clicks = 1
+            self.last_click = (now, (col, row))
+            self.sel_mode = (SEL_CHAR, SEL_WORD, SEL_LINE)[self.clicks - 1]
+            self.anchor = (col, row)
+            if self.clicks > 1:
+                self.select(con, cols, rows, col, row)
+            else:
+                setsel(fd, col, row, col, row, SEL_CLEAR)
+                self.selection = ("", None)
+        elif btn == BTN_RIGHT and self.selection[1] == name:
+            self.select(con, cols, rows, col, row)
+
+    def scroll(self, con, cols, rows, steps, mode):
+        if mode != 2:
+            return
+        col, row = self.cell(cols, rows)
+        code = WHEEL_UP if steps > 0 else WHEEL_DOWN
+        for _ in range(abs(steps)):
+            report(con[0], code, col, row)
+
+    def copy(self, name):
+        text, vt = self.selection
+        if text and vt == name:
+            self.clipboard = (text, os.stat(name).st_uid)
+            log(f"copied {len(text)} characters")
+
+    def paste(self, fd, name):
+        """Paste only into a console of the user the text was copied from:
+        the daemon types as root into whatever VT is in front."""
+        text, uid = self.clipboard
+        if not text or os.stat(name).st_uid != uid:
+            return
+        try:
+            # Unlike the other getters, this one is the ioctl's return value.
+            bracketed = fcntl.ioctl(fd, TIOCLINUX,
+                                    bytearray([TIOCL_GETBRACKETEDPASTE]))
+        except OSError:             # older kernel: no bracketed paste
+            bracketed = 0
+        data = text.encode()
+        if bracketed:
+            data = b"\033[200~" + data + b"\033[201~"
+        inject(fd, data)
+
+
+def finger_count(dev, code, value):
+    counts = {BTN_TOOL_FINGER: 1, BTN_TOOL_DOUBLETAP: 2,
+              BTN_TOOL_TRIPLETAP: 3, BTN_TOOL_QUADTAP: 4}
+    if value:
+        dev.fingers = counts[code]
+        dev.tap_fingers = max(dev.tap_fingers, dev.fingers)
+    elif dev.fingers == counts[code]:
+        dev.fingers = 0
+    dev.last_x = dev.last_y = None  # no jump when the finger count changes
+
+
+def take_steps(dev, amount, per_step):
+    """Accumulate scroll distance; return whole wheel steps (+ = up)."""
+    dev.scroll_acc += amount
+    steps = int(dev.scroll_acc / per_step)
+    dev.scroll_acc -= steps * per_step
+    return -steps   # moving down scrolls down, which is the wheel's "down"
+
+
+class Daemon:
+    def __init__(self):
+        self.devices = {}
+        self.pointer = Pointer()
+        self.console = Console()
+        self.keymap = Keymap()
+        self.keys_held = set()      # keyboard keys held, all keyboards
+
+    def frame(self, dev):
+        """Apply one SYN_REPORT worth of pointer events from one device."""
+        state = self.console.state()
+        if state is None:           # X: buttons pressed there are not ours
+            self.pointer.held.clear()
+            dev.reset_frame()
+            return
+        fd, cols, rows, mode = state
+        if self.keys_held & SHIFT:
+            mode = 0                # Shift bypasses the program: select
+        con = (fd, self.console.name)
+        pointer = self.pointer
+
+        dcols = drows = 0.0
+        steps = dev.wheel
+        if dev.pointer == "touchpad":
+            if dev.touching and dev.abs_x is not None and dev.last_x is not None:
+                mm_x = (dev.abs_x - dev.last_x) / dev.res_x
+                mm_y = (dev.abs_y - dev.last_y) / dev.res_y
+                dev.tap_travel += math.hypot(mm_x, mm_y)
+                if dev.fingers >= 2:
+                    steps += take_steps(dev, mm_y, TP_SCROLL_MM)
+                elif dev.fingers == 1:
+                    dcols, drows = mm_x * TP_COLS_PER_MM, mm_y * TP_ROWS_PER_MM
+            if dev.touching:
+                dev.last_x, dev.last_y = dev.abs_x, dev.abs_y
+            else:
+                dev.last_x = dev.last_y = None
+                dev.scroll_acc = 0.0
+        elif dev.middle_down:
+            if dev.dx or dev.dy:
+                dev.middle_moved = True
+            steps += take_steps(dev, dev.dy, REL_SCROLL_COUNTS)
+        else:
+            dcols = dev.dx * REL_COLS_PER_COUNT
+            drows = dev.dy * REL_ROWS_PER_COUNT
+
+        if dcols or drows:
+            pointer.move(con, cols, rows, dcols, drows, mode)
+        if steps:
+            pointer.scroll(con, cols, rows, steps, mode)
+        for btn, pressed in dev.keys:
+            pointer.button(con, cols, rows, btn, pressed, mode)
+        dev.reset_frame()
+
+    def key(self, code, value):
+        if value == 0:
+            self.keys_held.discard(code)
+            return
+        self.keys_held.add(code)
+        if value != 1 or code not in (KEY_C, KEY_V):
+            return
+        held = self.keys_held
+        ctrl, shift, alt = held & CTRL, held & SHIFT, KEY_LEFTALT in held
+        if not ((ctrl and shift and not alt) or (alt and not ctrl and not shift)):
+            return
+        state = self.console.state()
+        if state is None:
+            return
+        if code == KEY_C:
+            self.pointer.copy(self.console.name)
+        else:
+            self.pointer.paste(state[0], self.console.name)
+
+    def touch(self, dev, down):
+        """BTN_TOUCH: start a touch, or end it and turn it into a tap."""
+        dev.touching = down
+        now = time.monotonic()
+        if down:
+            dev.touch_start = now
+            return
+        tap = {1: BTN_LEFT, 2: BTN_RIGHT}.get(dev.tap_fingers)
+        if (tap and not dev.tap_clicked and now - dev.touch_start < TAP_SECONDS
+                and dev.tap_travel < TAP_MAX_MM):
+            dev.keys += [(tap, True), (tap, False)]
+        dev.tap_fingers, dev.tap_travel, dev.tap_clicked = 0, 0.0, False
+
+    def handle(self, dev, type_, code, value):
+        if type_ == EV_SYN and code == SYN_REPORT:
+            if dev.pointer:
+                self.frame(dev)
+        elif type_ == EV_REL:
+            if code == REL_X:
+                dev.dx += value
+            elif code == REL_Y:
+                dev.dy += value
+            elif code == REL_WHEEL:
+                dev.wheel += value
+        elif type_ == EV_ABS:
+            if code == ABS_X:
+                dev.abs_x = value
+            elif code == ABS_Y:
+                dev.abs_y = value
+        elif type_ == EV_KEY:
+            if dev.pointer and code == BTN_TOUCH:
+                self.touch(dev, bool(value))
+            elif dev.pointer and (code == BTN_TOOL_FINGER
+                                  or BTN_TOOL_DOUBLETAP <= code <= BTN_TOOL_QUADTAP):
+                finger_count(dev, code, value)
+            elif dev.pointer and code in BUTTON_CODE and value != 2:
+                btn = code
+                if dev.pointer == "touchpad":
+                    dev.tap_clicked = True
+                    if value and code == BTN_LEFT and dev.fingers >= 2:
+                        btn = BTN_RIGHT     # two-finger press
+                # Release what the press acted as, even if fingers changed.
+                if value:
+                    dev.pressed_as[code] = btn
+                else:
+                    btn = dev.pressed_as.pop(code, btn)
+                if code == BTN_MIDDLE:
+                    # Middle button scrolls while moved; a still click acts.
+                    if value:
+                        dev.middle_down, dev.middle_moved = True, False
+                        dev.scroll_acc = 0.0
+                        return
+                    dev.middle_down = False
+                    if dev.middle_moved:
+                        return
+                    dev.keys.append((btn, True))
+                dev.keys.append((btn, bool(value)))
+            elif dev.keyboard:
+                self.key(code, value)
+
+    def scan(self):
+        known = {d.path for d in self.devices.values()}
+        for path in sorted(glob.glob("/dev/input/event*")):
+            if path not in known:
+                dev = probe(path)
+                if dev:
+                    self.devices[dev.fd] = dev
+        self.keymap.apply()
+
+    def remove(self, dev):
+        """Device gone: forget it and anything it was holding down."""
+        os.close(dev.fd)
+        del self.devices[dev.fd]
+        if dev.pointer:
+            self.pointer.held.clear()
+        if dev.keyboard:
+            self.keys_held.clear()
+
+    def run(self):
+        next_scan = 0.0
+        while True:
+            if time.monotonic() >= next_scan:
+                try:
+                    self.scan()
+                except Exception:
+                    traceback.print_exc()
+                next_scan = time.monotonic() + RESCAN_SECONDS
+            ready, _, _ = select.select(list(self.devices), [], [],
+                                        RESCAN_SECONDS)
+            for fd in ready:
+                dev = self.devices[fd]
+                try:
+                    data = os.read(fd, EVENT.size * 64)
+                except BlockingIOError:
+                    continue
+                except OSError:         # unplugged
+                    data = b""
+                if not data:
+                    self.remove(dev)
+                    continue
+                for i in range(0, len(data) - EVENT.size + 1, EVENT.size):
+                    _, _, type_, code, value = EVENT.unpack_from(data, i)
+                    try:
+                        self.handle(dev, type_, code, value)
+                    except Exception as e:
+                        # One bad frame must not take the console mouse (and
+                        # the voided keymap entries) down with it.
+                        if not isinstance(e, OSError):  # OSError: VT vanished
+                            traceback.print_exc()
+                        self.console.close()
+                        dev.reset_frame()
+
+
+def main():
+    daemon = Daemon()
+    signal.signal(signal.SIGTERM, lambda signum, frame: sys.exit(0))
+    try:
+        daemon.run()
+    finally:
+        daemon.keymap.restore()
+
+
+if __name__ == "__main__":
+    main()
