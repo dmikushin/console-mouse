@@ -525,6 +525,15 @@ def take_steps(dev, amount, per_step):
     return -steps   # moving down scrolls down, which is the wheel's "down"
 
 
+def console_rotation():
+    """The foreground console's rotation in quarter turns clockwise."""
+    try:
+        with open("/sys/class/graphics/fbcon/rotate") as f:
+            return int(f.read().strip()) % 4
+    except (OSError, ValueError):
+        return 0
+
+
 class Daemon:
     def __init__(self):
         self.devices = {}
@@ -588,11 +597,15 @@ class Daemon:
         two-finger scrolling."""
         pointer = self.pointer
         (x0, x1), (y0, y1) = dev.ranges
+        quarter = console_rotation()
 
         def cell(xy):
-            col = 1 + (xy[0] - x0) * cols / (x1 - x0 + 1)
-            row = 1 + (xy[1] - y0) * rows / (y1 - y0 + 1)
-            return col, row
+            # Panel position as fractions, then turned the way the console
+            # is (fbcon rotate: quarter turns clockwise).
+            u = (xy[0] - x0) / (x1 - x0 + 1)
+            v = (xy[1] - y0) / (y1 - y0 + 1)
+            cx, cy = ((u, v), (v, 1 - u), (1 - u, 1 - v), (1 - v, u))[quarter]
+            return 1 + cx * cols, 1 + cy * rows
 
         def goto(col, row):
             pointer.move(con, cols, rows, col - pointer.x, row - pointer.y, mode)

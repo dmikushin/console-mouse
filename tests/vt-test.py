@@ -235,12 +235,45 @@ def touchscreen(ts):
         touch.two_drag(30, [10, 11, 12, 13, 14, 15])
 
     got = run_reader("report", 4.0, gestures)
+    failures = 0
     expected = (r(0, 10, 5) + r(3, 10, 5)              # tap
                 + r(2, 10, 5) + r(3, 10, 5)            # two-finger tap
                 + r(0, 5, 3) + r(32, 7, 3) + r(32, 8, 3) + r(3, 8, 3)  # drag
                 + r(64, 8, 3) * 2)                     # two-finger scroll
-    return check("touchscreen: tap, two-finger tap, drag, two-finger scroll",
-                 got, expected)
+    failures += check("touchscreen: tap, two-finger tap, drag, two-finger scroll",
+                      got, expected)
+
+    # Rotated console (fbcon rotate_all 1 = 90 degrees clockwise): the
+    # console's top-left is at the panel's top-right, so console cell
+    # (col, row) is touched at panel x = right - row, y = col.
+    rotate = "/sys/class/graphics/fbcon/rotate_all"
+    if not os.path.exists(rotate):
+        print("SKIP: rotated touchscreen (no fbcon rotation)")
+        return failures
+    with open(rotate, "w") as f:
+        f.write("1")
+    try:
+        time.sleep(0.5)
+        rows, cols, _, _ = struct.unpack("4H", fcntl.ioctl(
+            os.open(vt, os.O_RDONLY | os.O_NOCTTY), 0x5413, bytes(8)))
+        col, row = 6, 4
+
+        def rotated_tap():
+            x = int(SCREEN_W - (row - 0.5) * SCREEN_W / rows)
+            y = int((col - 0.5) * SCREEN_H / cols)
+            emit(ts, (EV_ABS, ABS_MT_SLOT, 0), (EV_ABS, ABS_MT_TRACKING_ID, 999),
+                 (EV_ABS, ABS_MT_POSITION_X, x), (EV_ABS, ABS_MT_POSITION_Y, y),
+                 (EV_KEY, BTN_TOUCH, 1))
+            emit(ts, (EV_ABS, ABS_MT_SLOT, 0), (EV_ABS, ABS_MT_TRACKING_ID, -1),
+                 (EV_KEY, BTN_TOUCH, 0))
+
+        got = run_reader("report", 2.0, rotated_tap)
+        failures += check("touchscreen on a console rotated 90 degrees",
+                          got, r(0, col, row) + r(3, col, row))
+    finally:
+        with open(rotate, "w") as f:
+            f.write("0")
+    return failures
 
 
 def r(code, col, row):
