@@ -75,6 +75,9 @@ SEL_CHAR, SEL_WORD, SEL_LINE, SEL_POINTER, SEL_CLEAR = 0, 1, 2, 3, 4
 # C and V entries are voided. AltGr is the Cyrillic lock of ruwin_cplk.
 K_HOLE = 0x0200
 VOIDED_TABLES = (4 | 1, 4 | 1 | 2, 8, 8 | 2)
+# The voided entries as they were before any instance changed them. In
+# /run: the kernel keymap does not survive a reboot either.
+KEYMAP_STATE = "/run/console-mouse/keymap-original"
 
 # Pointer speed in character cells.
 REL_COLS_PER_COUNT, REL_ROWS_PER_COUNT = 1 / 8, 1 / 16
@@ -189,15 +192,47 @@ def probe(path):
 class Keymap:
     """Void Ctrl+Shift+C/V and Alt+C/V in the console keymap (global to all
     VTs); restore the original entries on exit. Re-applied if something
-    reloads the keymap (loadkeys, systemd-vconsole-setup)."""
+    reloads the keymap (loadkeys, systemd-vconsole-setup).
+
+    The original entries are written to KEYMAP_STATE before the first change
+    and read back by the next instance: an instance that dies without
+    restoring (SIGKILL, a crash) leaves the holes in the kernel, and the next
+    one would otherwise take them for the originals and leave the chords dead
+    for good. (tty-i3-keys does the same for its own keycodes, in its own
+    file: the two never touch each other's entries.)"""
 
     def __init__(self):
-        self.fd = os.open("/dev/tty0", os.O_RDONLY | os.O_NOCTTY)
-        self.saved = {}
-        for table in VOIDED_TABLES:
-            for keycode in (KEY_C, KEY_V):
-                value = self.get(table, keycode)
-                self.saved[table, keycode] = value if value != K_HOLE else None
+        # /dev/tty0 opens the console in front at that moment, and an open
+        # console cannot be freed: open it only for each use, or a daemon
+        # started while a lock's spare VT is in front would pin that VT.
+        self.fd = None
+        self.saved = self.load()    # (table, keycode) -> original entry
+
+    @staticmethod
+    def load():
+        saved = {}
+        try:
+            with open(KEYMAP_STATE) as f:
+                for line in f:
+                    table, keycode, value = (int(x, 0) for x in line.split())
+                    saved[table, keycode] = value
+        except FileNotFoundError:
+            return saved
+        except (OSError, ValueError):
+            traceback.print_exc()
+            return saved
+        print(f"keymap: {len(saved)} original entries left by an instance "
+              "that did not restore them", flush=True)
+        return saved
+
+    def store(self):
+        os.makedirs(os.path.dirname(KEYMAP_STATE), exist_ok=True)
+        with open(KEYMAP_STATE + ".new", "w") as f:
+            f.writelines(f"{t} {k} {v:#06x}\n"
+                         for (t, k), v in sorted(self.saved.items()))
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(KEYMAP_STATE + ".new", KEYMAP_STATE)
 
     def get(self, table, keycode):
         buf = bytearray(struct.pack("BBH", table, keycode, 0))
@@ -208,16 +243,53 @@ class Keymap:
         fcntl.ioctl(self.fd, KDSKBENT, struct.pack("BBH", table, keycode, value))
 
     def apply(self):
-        for (table, keycode), saved in self.saved.items():
-            value = self.get(table, keycode)
-            if value != K_HOLE:
-                self.saved[table, keycode] = value   # keymap was reloaded
-                self.set(table, keycode, K_HOLE)
+        self.fd = os.open("/dev/tty0", os.O_RDONLY | os.O_NOCTTY)
+        try:
+            self._apply()
+        finally:
+            os.close(self.fd)
+            self.fd = None
+
+    def _apply(self):
+        # A missing table reads as a hole for every keycode but 0, and the
+        # chord then types nothing anyway: holes are left alone, which also
+        # keeps a hole write from allocating a table.
+        changes = []
+        for table in VOIDED_TABLES:
+            for keycode in (KEY_C, KEY_V):
+                value = self.get(table, keycode)
+                if value != K_HOLE:
+                    # The original, or a reloaded keymap's: the one to keep.
+                    changes.append((table, keycode, value))
+        if not changes:
+            return
+        for table, keycode, value in changes:
+            self.saved[table, keycode] = value
+        self.store()            # before the change: a crash leaves the record
+        for table, keycode, _ in changes:
+            self.set(table, keycode, K_HOLE)
+        print(f"keymap: voided {len(changes)} entries: " + ", ".join(
+            f"t{t}/k{k} {v:#06x}" for t, k, v in changes), flush=True)
 
     def restore(self):
-        for (table, keycode), saved in self.saved.items():
-            if saved is not None:
-                self.set(table, keycode, saved)
+        self.fd = os.open("/dev/tty0", os.O_RDONLY | os.O_NOCTTY)
+        try:
+            failed = False
+            for (table, keycode), value in self.saved.items():
+                try:
+                    self.set(table, keycode, value)
+                except OSError:
+                    traceback.print_exc()
+                    failed = True
+            print(f"keymap: restored {len(self.saved)} entries", flush=True)
+            if not failed:
+                try:
+                    os.unlink(KEYMAP_STATE)
+                except FileNotFoundError:
+                    pass
+        finally:
+            os.close(self.fd)
+            self.fd = None
 
 
 class Console:

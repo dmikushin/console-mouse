@@ -18,6 +18,7 @@ mouse, touchpad and keyboard through uinput, and checks what arrives:
 Then switches back to the original VT.
 """
 import fcntl
+import glob
 import json
 import os
 import pwd
@@ -280,10 +281,10 @@ def r(code, col, row):
     return b"\033[M" + bytes([32 + code, 32 + col, 32 + row])
 
 
-def keymap_entries():
+def keymap_entries(tables=(5, 7, 8, 10)):
     fd = os.open("/dev/tty0", os.O_RDONLY | os.O_NOCTTY)
     out = []
-    for table in (5, 7, 8, 10):
+    for table in tables:
         for key in (KEY_C, KEY_V):
             buf = bytearray(struct.pack("BBH", table, key, 0))
             fcntl.ioctl(fd, 0x4B46, buf)        # KDGKBENT
@@ -324,7 +325,73 @@ def fake_dictation():
     return commands, close
 
 
+KEYMAP_STATE = "/run/console-mouse/keymap-original"
+
+
+def keymap_crash():
+    """A daemon killed with SIGKILL leaves its holes in the kernel keymap;
+    the next instance must restore the real originals from the state file,
+    not the holes it finds. Keycodes C and V in all 256 tables are compared
+    with their values before the test."""
+    every = range(256)
+    before = keymap_entries(every)
+    failures = 0
+    first = subprocess.Popen([sys.executable, DAEMON])
+    for _ in range(50):                     # until it has voided the chords
+        time.sleep(0.1)
+        if keymap_entries(every) != before:
+            break
+    first.kill()
+    first.wait()
+    failures += check("SIGKILL leaves the originals on disk",
+                      str(os.path.exists(KEYMAP_STATE)).encode(), b"True")
+    second = subprocess.Popen([sys.executable, DAEMON],
+                              stdout=subprocess.PIPE, text=True)
+    time.sleep(1.0)
+    second.terminate()
+    log = second.communicate()[0]
+    failures += check("next instance takes the originals from the file",
+                      str("left by an instance that did not restore" in log).encode(),
+                      b"True")
+    failures += check("keymap C/V in all tables restored after SIGKILL + restart",
+                      str(keymap_entries(every)).encode(), str(before).encode())
+    failures += check("state file removed after a clean restore",
+                      str(os.path.exists(KEYMAP_STATE)).encode(), b"False")
+    return failures
+
+
+def console_locked():
+    """A console lock (Win+Escape) blocks every VT switch: the test would
+    hang on chvt."""
+    if os.path.exists("/run/tty-i3-keys/lock.json"):
+        return True
+    for comm in glob.glob("/proc/[0-9]*/comm"):
+        try:
+            if open(comm).read().strip() in ("ttysecurelock", "vlock"):
+                return True
+        except OSError:
+            pass
+    return False
+
+
 def main():
+    only = sys.argv[1:]                     # e.g. keymap-crash
+    # One VT test at a time (tty-i3-keys' and ttysecurelock's take it too).
+    lockfile = open("/tmp/vt12-test.lock", "w")
+    fcntl.flock(lockfile, fcntl.LOCK_EX)
+    if console_locked():
+        sys.exit("the console is locked (Win+Escape): unlock it first")
+    if only == ["keymap-crash"]:
+        service = subprocess.run(["systemctl", "is-active", "--quiet",
+                                  "console-mouse"]).returncode == 0
+        if service:
+            subprocess.run(["systemctl", "stop", "console-mouse"], check=True)
+        try:
+            failures = keymap_crash()
+        finally:
+            if service:
+                subprocess.run(["systemctl", "start", "console-mouse"])
+        sys.exit(1 if failures else 0)
     original = open("/sys/class/tty/tty0/active").read().strip()[3:]
     # An installed daemon would answer the same events a second time.
     service = subprocess.run(["systemctl", "is-active", "--quiet",
@@ -430,6 +497,7 @@ def main():
         failures += check("keymap restored on stop",
                           str(keymap_entries()).encode(),
                           str(keymap_before).encode())
+        failures += keymap_crash()
         subprocess.run(["chvt", original])
         for fd in (m, tp, kb, ts):
             fcntl.ioctl(fd, UI_DEV_DESTROY)
