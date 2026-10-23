@@ -281,8 +281,20 @@ def r(code, col, row):
     return b"\033[M" + bytes([32 + code, 32 + col, 32 + row])
 
 
+def daemon_module():
+    import importlib.machinery
+    import importlib.util
+    loader = importlib.machinery.SourceFileLoader("daemon", DAEMON)
+    spec = importlib.util.spec_from_loader("daemon", loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
 def keymap_entries(tables=(5, 7, 8, 10)):
-    fd = os.open("/dev/tty0", os.O_RDONLY | os.O_NOCTTY)
+    # Through a Unicode-mode VT: through /dev/tty0 with X in front, Unicode
+    # entries would read as holes (see unicode_vt in the daemon).
+    fd = daemon_module().unicode_vt()
     out = []
     for table in tables:
         for key in (KEY_C, KEY_V):
@@ -326,6 +338,65 @@ def fake_dictation():
 
 
 KEYMAP_STATE = "/run/console-mouse/keymap-original"
+
+
+def kb_entry(fd, table, key, value=None):
+    if value is None:
+        buf = bytearray(struct.pack("BBH", table, key, 0))
+        fcntl.ioctl(fd, 0x4B46, buf)            # KDGKBENT
+        return struct.unpack("BBH", buf)[2]
+    fcntl.ioctl(fd, 0x4B47, struct.pack("BBH", table, key, value))   # KDSKBENT
+
+
+def keymap_snapshot(fd):
+    """Every entry of every allocated table, read through a Unicode VT."""
+    return {(t, k): kb_entry(fd, t, k) for t in range(256)
+            if kb_entry(fd, t, 0) != 0x027F for k in range(256)}
+
+
+def unicode_keymap_test():
+    """The daemon must handle Unicode keymap entries even when the VT in
+    front is not in Unicode mode (X): read through such a VT they look like
+    holes. A Unicode value (U+0441) is put into a chord it voids (Ctrl+Shift
+    +C, table 5): it must be voided while the daemon runs and come back after
+    a clean stop and after SIGKILL + restart + stop; the whole keymap must
+    be unchanged."""
+    fd = daemon_module().unicode_vt()
+    front = open("/sys/class/tty/tty0/active").read().strip()
+    tfd = os.open("/dev/tty0", os.O_RDONLY | os.O_NOCTTY)
+    mode = bytearray(4)
+    fcntl.ioctl(tfd, 0x4B44, mode)              # KDGKBMODE
+    os.close(tfd)
+    print(f"  VT in front: {front}, keyboard mode {struct.unpack('i', mode)[0]}"
+          f" (3 = Unicode; X is not)")
+    before = keymap_snapshot(fd)
+    slot, value = (5, KEY_C), 0xf441
+    original = kb_entry(fd, *slot)
+    kb_entry(fd, *slot, value)
+    seen = []
+    try:
+        d = subprocess.Popen([sys.executable, DAEMON])
+        time.sleep(1.2)
+        seen.append(kb_entry(fd, *slot))        # voided while running
+        d.terminate(); d.wait()
+        seen.append(kb_entry(fd, *slot))        # back after a clean stop
+        d = subprocess.Popen([sys.executable, DAEMON])
+        time.sleep(1.2)
+        d.kill(); d.wait()
+        d = subprocess.Popen([sys.executable, DAEMON])
+        time.sleep(1.2)
+        d.terminate(); d.wait()
+        seen.append(kb_entry(fd, *slot))        # back after SIGKILL + restart
+    finally:
+        kb_entry(fd, *slot, original)
+        after = keymap_snapshot(fd)
+        os.close(fd)
+    failures = check("Unicode entry voided and kept with X in front (run, stop, kill+restart)",
+                     " ".join(f"{v:#06x}" for v in seen).encode(),
+                     b"0x0200 0xf441 0xf441")
+    failures += check("whole keymap unchanged", str(after == before).encode(),
+                      b"True")
+    return failures
 
 
 def keymap_crash():
@@ -381,13 +452,13 @@ def main():
     fcntl.flock(lockfile, fcntl.LOCK_EX)
     if console_locked():
         sys.exit("the console is locked (Win+Escape): unlock it first")
-    if only == ["keymap-crash"]:
+    if only in (["keymap-crash"], ["unicode"]):
         service = subprocess.run(["systemctl", "is-active", "--quiet",
                                   "console-mouse"]).returncode == 0
         if service:
             subprocess.run(["systemctl", "stop", "console-mouse"], check=True)
         try:
-            failures = keymap_crash()
+            failures = keymap_crash() if only == ["keymap-crash"] else unicode_keymap_test()
         finally:
             if service:
                 subprocess.run(["systemctl", "start", "console-mouse"])
@@ -398,6 +469,8 @@ def main():
                               "console-mouse"]).returncode == 0
     if service:
         subprocess.run(["systemctl", "stop", "console-mouse"], check=True)
+    # Before any VT switch: with X in front, as on a laptop running i3.
+    unicode_failures = unicode_keymap_test()
     keymap_before = keymap_entries()
     m = uinput("console-mouse test mouse", mouse_setup)
     tp = uinput("console-mouse test touchpad", touchpad_setup)
@@ -407,7 +480,7 @@ def main():
     time.sleep(0.3)
     daemon = subprocess.Popen([sys.executable, DAEMON])
     time.sleep(0.5)
-    failures = 0
+    failures = unicode_failures
     try:
         def copy_paste():
             goto(m, 1, 1)                        # drag-select "HELLO"
