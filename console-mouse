@@ -66,6 +66,11 @@ EVIOCGBIT = lambda ev, size: 0x80004520 | (size << 16) | ev
 EVIOCGPROP = 0x80044509
 EVIOCGABS = lambda axis: 0x80184540 + axis
 KDGETMODE, KD_TEXT = 0x4B3B, 0x00
+# Keyboard modes in which a program reads characters (TIOCSTI input is text).
+# In K_RAW / K_MEDIUMRAW it reads scancodes or keycodes itself (a screen lock
+# such as ttysecurelock does): injected bytes would be taken as keys, so the
+# daemon leaves such a VT alone, as it leaves X alone.
+KDGKBMODE, K_XLATE, K_UNICODE = 0x4B44, 0x01, 0x03
 KDGKBENT, KDSKBENT = 0x4B46, 0x4B47
 TIOCLINUX, TIOCSTI, TIOCGWINSZ = 0x541C, 0x5412, 0x5413
 TIOCL_SETSEL, TIOCL_GETMOUSEREPORTING, TIOCL_GETBRACKETEDPASTE = 2, 7, 18
@@ -370,6 +375,10 @@ class Console:
         mode = bytearray(4)
         fcntl.ioctl(self.fd, KDGETMODE, mode)
         if struct.unpack("i", mode)[0] != KD_TEXT:
+            return None
+        kbmode = bytearray(4)
+        fcntl.ioctl(self.fd, KDGKBMODE, kbmode)
+        if struct.unpack("i", kbmode)[0] not in (K_XLATE, K_UNICODE):
             return None
         return (self.fd, *size(self.fd), tioclinux_get(self.fd,
                                                       TIOCL_GETMOUSEREPORTING))
