@@ -28,8 +28,8 @@ default and Shift hands the drag to the program.
 
 | keys | action |
 |---|---|
-| Ctrl+Shift+C, Alt+C, Ctrl+Insert | copy the selection |
-| Ctrl+Shift+V, Alt+V, Shift+Insert | paste (bracketed if the program enabled DECSET 2004) |
+| Ctrl+Shift+C, Alt+C, Ctrl+Alt+C, Ctrl+Insert | copy the selection |
+| Ctrl+Shift+V, Alt+V, Ctrl+Alt+V, Shift+Insert | paste (bracketed if the program enabled DECSET 2004) |
 
 Selecting does not copy: there is no PRIMARY to paste with a middle click,
 the middle button belongs to dictation, so a copy chord is needed, as with
@@ -37,8 +37,9 @@ Ctrl+Shift+C in a graphical terminal.
 
 These chords are voided in the console keymap while the daemon runs (and
 restored when it stops), so the program does not also receive ^C, ^V, ESC c,
-ESC v or Insert. Reports and pastes are injected into the tty input with
-`TIOCSTI`. The original entries are kept in
+ESC v, ESC ^C, ESC ^V or Insert. The chords are keycodes, so they
+work the same in the Cyrillic layout (the AltGr lock of `ruwin_cplk`).
+Reports and pastes are injected into the tty input with `TIOCSTI`. The original entries are kept in
 `/run/console-mouse/keymap-original` from before the first change until a
 clean restore, so an instance that was killed is undone by the next one.
 

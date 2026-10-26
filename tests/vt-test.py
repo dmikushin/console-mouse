@@ -45,7 +45,7 @@ ABS_X, ABS_Y = 0, 1
 BTN_LEFT, BTN_RIGHT, BTN_MIDDLE = 0x110, 0x111, 0x112
 BTN_TOOL_FINGER, BTN_TOUCH, BTN_TOOL_DOUBLETAP = 0x145, 0x14A, 0x14D
 KEY_LEFTCTRL, KEY_LEFTSHIFT, KEY_LEFTALT, KEY_C, KEY_V = 29, 42, 56, 46, 47
-KEY_ENTER, KEY_INSERT = 28, 110
+KEY_ENTER, KEY_INSERT, KEY_CAPSLOCK = 28, 110, 58
 # Owner of the test VT for the middle click: the daemon's dictation client
 # runs as this user, so it must exist.
 FAKE_UID = pwd.getpwnam("nobody").pw_uid
@@ -97,7 +97,7 @@ def mouse_setup(fd):
 def keyboard_setup(fd):
     fcntl.ioctl(fd, UI_SET_EVBIT, EV_KEY)
     for k in (KEY_LEFTCTRL, KEY_LEFTSHIFT, KEY_LEFTALT, KEY_C, KEY_V,
-              KEY_ENTER, KEY_INSERT):
+              KEY_ENTER, KEY_INSERT, KEY_CAPSLOCK):
         fcntl.ioctl(fd, UI_SET_KEYBIT, k)
 
 
@@ -511,6 +511,26 @@ def main():
         failures += check("select + Ctrl+Shift+C/V, Alt+C/V",
                           got, b"HELLOWORLDWORLD")
 
+        def ctrl_alt():
+            # Ctrl+Alt+C/V in the Latin layout, then in the Cyrillic one
+            # (CapsLock is the AltGr lock of ruwin_cplk: C types U+0441).
+            # Nothing of the chords may leak (ESC ^C, ESC ^V).
+            drag(m, 1, 1, 4)                     # "HELLO"
+            chord(kb, KEY_LEFTCTRL, KEY_LEFTALT, KEY_C)
+            chord(kb, KEY_LEFTCTRL, KEY_LEFTALT, KEY_V)
+            chord(kb, KEY_CAPSLOCK)
+            try:
+                chord(kb, KEY_C)
+                clicks(m, 9, 1, 2)               # "WORLD"
+                chord(kb, KEY_LEFTCTRL, KEY_LEFTALT, KEY_C)
+                chord(kb, KEY_LEFTCTRL, KEY_LEFTALT, KEY_V)
+            finally:
+                chord(kb, KEY_CAPSLOCK)
+
+        got = run_reader("plain", 4.0, ctrl_alt)
+        failures += check("Ctrl+Alt+C/V, Latin and Cyrillic layouts",
+                          got, "HELLOсWORLD".encode())
+
         got = run_reader("bracketed", 1.5,
                          lambda: chord(kb, KEY_LEFTALT, KEY_V))
         failures += check("bracketed paste",
@@ -704,9 +724,22 @@ def copy_paste_round(m, kb):
     chord(kb, KEY_LEFTCTRL, KEY_INSERT)
     chord(kb, KEY_LEFTSHIFT, KEY_INSERT)
     enter()
+    drag(m, col, row, 4)                        # "alpha", Latin layout
+    chord(kb, KEY_LEFTCTRL, KEY_LEFTALT, KEY_C)
+    chord(kb, KEY_LEFTCTRL, KEY_LEFTALT, KEY_V)
+    enter()
+    chord(kb, KEY_CAPSLOCK)                     # Cyrillic layout
+    try:
+        drag(m, col + 6, row + 1, 4)            # "delta"
+        chord(kb, KEY_LEFTCTRL, KEY_LEFTALT, KEY_C)
+        chord(kb, KEY_LEFTCTRL, KEY_LEFTALT, KEY_V)
+        chord(kb, KEY_C)                        # proves the layout: U+0441
+        enter()
+    finally:
+        chord(kb, KEY_CAPSLOCK)
     time.sleep(0.5)
     # A line selection ends with the line break, as the kernel's does.
-    return "alpha beta\nbeta\ngamma delta\n\ngamma\n"
+    return "alpha beta\nbeta\ngamma delta\n\ngamma\nalpha\ndeltaс\n"
 
 
 BRACKET_PROBE = r"""
@@ -764,7 +797,8 @@ def tmux_suite(m, kb):
             stop()
         got = open(out).read() if os.path.exists(out) else "<no file>"
         failures += check(f"{name}: drag, double, triple click; copy + paste "
-                          "by Ctrl+Shift, Alt, Insert chords", got.encode(),
+                          "by Ctrl+Shift, Alt, Insert, Ctrl+Alt chords "
+                          "(Latin and Cyrillic)", got.encode(),
                           expected.encode())
         if levels == 0:
             continue

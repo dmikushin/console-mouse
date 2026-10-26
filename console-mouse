@@ -20,10 +20,11 @@ text mode (KD_TEXT, i.e. not X):
     what tmux "set -g mouse on" understands. Shift held hands the left
     button to the program, drag included (tmux pane borders, mc);
     without reporting, a right click extends the selection;
-  * Ctrl+Shift+C, Alt+C or Ctrl+Insert copies the selection, Ctrl+Shift+V,
-    Alt+V or Shift+Insert pastes it (bracketed if the program enabled DECSET
-    2004). These chords are voided in the console keymap so the program does
-    not also get ^C, ^V, ESC c, ESC v or Insert;
+  * Ctrl+Shift+C, Alt+C, Ctrl+Alt+C or Ctrl+Insert copies the selection,
+    Ctrl+Shift+V, Alt+V, Ctrl+Alt+V or Shift+Insert pastes it (bracketed if
+    the program enabled DECSET 2004). These chords are voided in the console
+    keymap so the program does not also get ^C, ^V, ESC c, ESC v, ESC ^C,
+    ESC ^V or Insert;
   * a middle click toggles nerd-dictation (its daemon's socket), as the
     middle button does under X; the middle button is not passed on.
 
@@ -83,9 +84,11 @@ SEL_CHAR, SEL_WORD, SEL_LINE, SEL_POINTER, SEL_CLEAR = 0, 1, 2, 3, 4
 
 # Keymap entries voided, as (table, keycode); tables are modifier bit sets:
 # shift 1, altgr 2, control 4, alt 8. AltGr is the Cyrillic lock of
-# ruwin_cplk. Ctrl+Shift+C/V, Alt+C/V, Shift+Insert, Ctrl+Insert.
+# ruwin_cplk. Ctrl+Shift+C/V, Alt+C/V, Ctrl+Alt+C/V, Shift+Insert,
+# Ctrl+Insert.
 K_HOLE = 0x0200
-VOIDED = tuple((t, k) for t in (4 | 1, 4 | 1 | 2, 8, 8 | 2) for k in (KEY_C, KEY_V)) + \
+VOIDED = tuple((t, k) for t in (4 | 1, 4 | 1 | 2, 8, 8 | 2, 4 | 8, 4 | 8 | 2)
+               for k in (KEY_C, KEY_V)) + \
     tuple((t, KEY_INSERT) for t in (1, 1 | 2, 4, 4 | 2))
 # The voided entries as they were before any instance changed them. In
 # /run: the kernel keymap does not survive a reboot either.
@@ -924,7 +927,8 @@ class Daemon:
             if alt or bool(ctrl) == bool(shift):
                 return
             copy = bool(ctrl)       # Ctrl+Insert copies, Shift+Insert pastes
-        elif (ctrl and shift and not alt) or (alt and not ctrl and not shift):
+        elif (ctrl and shift and not alt) or (alt and not shift):
+            # Ctrl+Shift, Alt or Ctrl+Alt: the voided chords
             copy = code == KEY_C
         else:
             return
