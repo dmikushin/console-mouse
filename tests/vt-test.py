@@ -6,14 +6,18 @@ mouse, touchpad and keyboard through uinput, and checks what arrives:
   1. no mouse reporting: drag-select + Ctrl+Shift+C/V, double-click word +
      Alt+C/V paste exactly the selected text, and nothing else (the chords
      are voided in the keymap); with DECSET 2004 the paste is bracketed;
-  2. DECSET 1000 (what tmux sends): wheel, click, drag, TrackPoint middle
+  2. DECSET 1000 (what tmux sends): wheel, click, TrackPoint middle
      scroll, touchpad two-finger scroll and one/two-finger taps arrive as
-     xterm X10 reports; the
-     middle button is not reported; Shift+drag selects instead of reporting;
+     xterm X10 reports; the middle button is not reported; a plain drag
+     selects instead of reporting, Shift+drag is reported;
   3. a middle click sends {"action": "toggle"} to the console owner's
      nerd-dictation socket (a fake one here); the clipboard is not pasted
      into a console of another user;
-  4. a real tmux scrolls its history with the wheel;
+  4. a real tmux scrolls its history with the wheel; in a bare shell, in
+     tmux and in tmux inside tmux, drag / double / triple click + copy and
+     paste chords reach `cat` in the innermost pane exactly, bracketed only
+     when that program enabled 2004; in tmux a click selects a pane and a
+     window, Shift+drag on a pane border resizes it;
   5. the console keymap is restored when the daemon stops.
 Then switches back to the original VT.
 """
@@ -22,6 +26,7 @@ import glob
 import json
 import os
 import pwd
+import shlex
 import socket
 import threading
 import struct
@@ -40,6 +45,7 @@ ABS_X, ABS_Y = 0, 1
 BTN_LEFT, BTN_RIGHT, BTN_MIDDLE = 0x110, 0x111, 0x112
 BTN_TOOL_FINGER, BTN_TOUCH, BTN_TOOL_DOUBLETAP = 0x145, 0x14A, 0x14D
 KEY_LEFTCTRL, KEY_LEFTSHIFT, KEY_LEFTALT, KEY_C, KEY_V = 29, 42, 56, 46, 47
+KEY_ENTER, KEY_INSERT = 28, 110
 # Owner of the test VT for the middle click: the daemon's dictation client
 # runs as this user, so it must exist.
 FAKE_UID = pwd.getpwnam("nobody").pw_uid
@@ -90,7 +96,8 @@ def mouse_setup(fd):
 
 def keyboard_setup(fd):
     fcntl.ioctl(fd, UI_SET_EVBIT, EV_KEY)
-    for k in (KEY_LEFTCTRL, KEY_LEFTSHIFT, KEY_LEFTALT, KEY_C, KEY_V):
+    for k in (KEY_LEFTCTRL, KEY_LEFTSHIFT, KEY_LEFTALT, KEY_C, KEY_V,
+              KEY_ENTER, KEY_INSERT):
         fcntl.ioctl(fd, UI_SET_KEYBIT, k)
 
 
@@ -239,9 +246,9 @@ def touchscreen(ts):
     failures = 0
     expected = (r(0, 10, 5) + r(3, 10, 5)              # tap
                 + r(2, 10, 5) + r(3, 10, 5)            # two-finger tap
-                + r(0, 5, 3) + r(32, 7, 3) + r(32, 8, 3) + r(3, 8, 3)  # drag
+                # one-finger drag: the console's selection, not reported
                 + r(64, 8, 3) * 2)                     # two-finger scroll
-    failures += check("touchscreen: tap, two-finger tap, drag, two-finger scroll",
+    failures += check("touchscreen: tap, two-finger tap, drag (selects), two-finger scroll",
                       got, expected)
 
     # Rotated console (fbcon rotate_all 1 = 90 degrees clockwise): the
@@ -515,7 +522,7 @@ def main():
             emit(m, (EV_REL, REL_WHEEL, -1))
             click(m, BTN_LEFT)
             emit(m, (EV_KEY, BTN_LEFT, 1))
-            emit(m, (EV_REL, REL_X, 8))          # drag to column 4
+            emit(m, (EV_REL, REL_X, 8))          # drag to column 4: selects
             emit(m, (EV_KEY, BTN_LEFT, 0))
             emit(m, (EV_KEY, BTN_MIDDLE, 1))     # TrackPoint scroll: 2 down
             emit(m, (EV_REL, REL_Y, 24))
@@ -531,13 +538,19 @@ def main():
                 emit(tp, (EV_KEY, BTN_TOUCH, 1), (EV_KEY, tool, 1),
                      (EV_ABS, ABS_X, 1000), (EV_ABS, ABS_Y, 600))
                 emit(tp, (EV_KEY, BTN_TOUCH, 0), (EV_KEY, tool, 0))
-            # Shift+drag selects "HELLO" instead of reporting; then paste it.
+            # Shift+drag goes to the program.
             goto(m, 1, 1)
             emit(kb, (EV_KEY, KEY_LEFTSHIFT, 1))
             emit(m, (EV_KEY, BTN_LEFT, 1))
             emit(m, (EV_REL, REL_X, 4 * 8))
             emit(m, (EV_KEY, BTN_LEFT, 0))
             emit(kb, (EV_KEY, KEY_LEFTSHIFT, 0))
+            # A plain drag selects "HELLO"; paste it.
+            time.sleep(MULTI_CLICK)
+            goto(m, 1, 1)
+            emit(m, (EV_KEY, BTN_LEFT, 1))
+            emit(m, (EV_REL, REL_X, 4 * 8))
+            emit(m, (EV_KEY, BTN_LEFT, 0))
             chord(kb, KEY_LEFTALT, KEY_C)
             chord(kb, KEY_LEFTALT, KEY_V)
             # Still middle click: dictation toggle, not a report.
@@ -551,19 +564,20 @@ def main():
         got = run_reader("report", 4.0, reports)
         expected = (r(64, 3, 2) + r(65, 3, 2)          # wheel up, down
                     + r(0, 3, 2) + r(3, 3, 2)          # left click
-                    + r(0, 3, 2) + r(32, 4, 2) + r(3, 4, 2)  # drag
                     + r(65, 4, 2) * 2                  # middle-button scroll
                     + r(64, 4, 2) * 2                  # two-finger scroll
                     + r(0, 4, 2) + r(3, 4, 2)          # one-finger tap
                     + r(2, 4, 2) + r(3, 4, 2)          # two-finger tap
-                    + b"HELLO")                        # Shift+drag, Alt+C/V
-        failures += check("xterm reports (tmux mouse), Shift bypass",
+                    + r(0, 1, 1) + r(32, 5, 1) + r(3, 5, 1)  # Shift+drag
+                    + b"HELLO")                        # drag, Alt+C/V
+        failures += check("xterm reports (tmux mouse): drag selects, Shift+drag reported",
                           got, expected)
         failures += check("middle click toggles nerd-dictation",
                           json.dumps(commands).encode(),
                           b'[{"action": "toggle"}]')
         failures += touchscreen(ts)
         failures += tmux_scroll(m)
+        failures += tmux_suite(m, kb)
     finally:
         daemon.terminate()
         daemon.wait()
@@ -612,6 +626,221 @@ def tmux_scroll(m):
         print("  tmux stderr:", open(log).read().strip())
     return check("real tmux: wheel scrolls the pane history",
                  got.encode(), b"1 10 / 1 5")
+
+
+MULTI_CLICK = 0.5   # longer than the daemon's double-click interval
+TMUX_CONF = """set -g mouse on
+set -g default-terminal screen
+set -g status-left '[s] '
+set -g escape-time 0
+"""
+SAMPLE = r"alpha beta\ngamma delta\n"     # printf format
+
+
+def vt_text():
+    """The VT's characters as rows of strings."""
+    fd = os.open(f"/dev/tty{VT}", os.O_RDONLY | os.O_NOCTTY)
+    rows, cols, _, _ = struct.unpack("4H", fcntl.ioctl(fd, 0x5413, bytes(8)))
+    os.close(fd)
+    data = open(f"/dev/vcsu{VT}", "rb").read()[:cols * rows * 4]
+    chars = data.decode(f"utf-32-{sys.byteorder[0]}e", errors="replace")
+    return [chars[i * cols:(i + 1) * cols] for i in range(rows)]
+
+
+def vcsa_attr(col, row):
+    """The attribute byte of a VT cell (1-based)."""
+    data = open(f"/dev/vcsa{VT}", "rb").read()
+    cols = data[1]
+    return data[4 + ((row - 1) * cols + col - 1) * 2 + 1]
+
+
+def find(text, rows=None):
+    """(col, row), 1-based, of the first occurrence of text on the VT."""
+    for i, line in enumerate(vt_text()):
+        if rows and i + 1 not in rows:
+            continue
+        if text in line:
+            return line.index(text) + 1, i + 1
+    raise RuntimeError(f"{text!r} not on the screen:\n" + "\n".join(vt_text()))
+
+
+def drag(m, col, row, cells, shift_kb=None):
+    goto(m, col, row)
+    if shift_kb is not None:
+        emit(shift_kb, (EV_KEY, KEY_LEFTSHIFT, 1))
+    emit(m, (EV_KEY, BTN_LEFT, 1))
+    emit(m, (EV_REL, REL_X, cells * 8))
+    emit(m, (EV_KEY, BTN_LEFT, 0))
+    if shift_kb is not None:
+        emit(shift_kb, (EV_KEY, KEY_LEFTSHIFT, 0))
+    time.sleep(MULTI_CLICK)
+
+
+def clicks(m, col, row, n):
+    goto(m, col, row)
+    for _ in range(n):
+        click(m, BTN_LEFT)
+    time.sleep(MULTI_CLICK)
+
+
+def copy_paste_round(m, kb):
+    """Select and paste into the `cat` under the sample text; returns what
+    the selections were expected to give, as cat writes it."""
+    enter = lambda: chord(kb, KEY_ENTER)
+    col, row = find("alpha beta")
+    drag(m, col, row, 9)                        # "alpha beta"
+    chord(kb, KEY_LEFTCTRL, KEY_LEFTSHIFT, KEY_C)
+    chord(kb, KEY_LEFTCTRL, KEY_LEFTSHIFT, KEY_V)
+    enter()
+    clicks(m, col + 7, row, 2)                  # "beta"
+    chord(kb, KEY_LEFTALT, KEY_C)
+    chord(kb, KEY_LEFTALT, KEY_V)
+    enter()
+    clicks(m, col + 2, row + 1, 3)              # the line "gamma delta"
+    chord(kb, KEY_LEFTCTRL, KEY_INSERT)
+    chord(kb, KEY_LEFTSHIFT, KEY_INSERT)
+    enter()
+    drag(m, col, row + 1, 4)                    # "gamma"
+    chord(kb, KEY_LEFTCTRL, KEY_INSERT)
+    chord(kb, KEY_LEFTSHIFT, KEY_INSERT)
+    enter()
+    time.sleep(0.5)
+    # A line selection ends with the line break, as the kernel's does.
+    return "alpha beta\nbeta\ngamma delta\n\ngamma\n"
+
+
+BRACKET_PROBE = r"""
+import os, select, sys, termios, time, tty
+on, out = sys.argv[1] == "on", sys.argv[2]
+tty.setraw(0)
+os.write(1, b"\033[H\033[2Jready\r\n" + (b"\033[?2004h" if on else b""))
+got, end = b"", time.time() + float(sys.argv[3])
+while time.time() < end:
+    if select.select([0], [], [], 0.05)[0]:
+        got += os.read(0, 1024)
+open(out, "wb").write(got)
+"""
+
+
+def tmux_suite(m, kb):
+    """Bare shell, tmux, tmux in tmux: the console's selection and copy and
+    paste, with the innermost pane's program as the target."""
+    failures = 0
+    conf = tempfile.mktemp()
+    open(conf, "w").write(TMUX_CONF)
+    probe = tempfile.mktemp(suffix=".py")
+    open(probe, "w").write(BRACKET_PROBE)
+    outer = ["tmux", "-L", "cm-outer", "-f", conf]
+    inner = ["tmux", "-L", "cm-inner", "-f", conf]
+    q = lambda args: " ".join(shlex.quote(a) for a in args)
+
+    def target(out):
+        return f'clear; printf "{SAMPLE}"; exec cat > {out}'
+
+    def start(levels, command):
+        """Run command in the innermost of `levels` tmuxes on the VT."""
+        cmd = command
+        if levels == 2:
+            cmd = f"env -u TMUX {q(inner)} new-session -s i {q(['sh', '-c', cmd])}"
+        if levels >= 1:
+            cmd = f"{q(outer)} new-session -s s {q(['sh', '-c', cmd])}"
+        subprocess.run(["openvt", "-c", str(VT), "-f", "--", "sh", "-c",
+                        "TERM=linux exec sh -c \"$0\"", cmd], check=True)
+        subprocess.run(["chvt", str(VT)], check=True)
+        time.sleep(2.0)
+
+    def stop():
+        for t in (inner, outer):
+            subprocess.run([*t, "kill-server"], capture_output=True)
+        subprocess.run(["pkill", "-t", f"tty{VT}"])
+        time.sleep(0.5)
+
+    for levels, name in ((0, "bare shell"), (1, "tmux"), (2, "tmux in tmux")):
+        out = tempfile.mktemp()
+        start(levels, target(out))
+        try:
+            expected = copy_paste_round(m, kb)
+        finally:
+            stop()
+        got = open(out).read() if os.path.exists(out) else "<no file>"
+        failures += check(f"{name}: drag, double, triple click; copy + paste "
+                          "by Ctrl+Shift, Alt, Insert chords", got.encode(),
+                          expected.encode())
+        if levels == 0:
+            continue
+        for on in ("on", "off"):
+            out = tempfile.mktemp()
+            start(levels, f"exec python3 {probe} {on} {out} 6")
+            try:
+                col, row = find("ready")
+                drag(m, col, row, 4)
+                chord(kb, KEY_LEFTALT, KEY_C)
+                chord(kb, KEY_LEFTALT, KEY_V)
+                for _ in range(100):
+                    if os.path.exists(out):
+                        break
+                    time.sleep(0.1)
+            finally:
+                stop()
+            got = open(out, "rb").read() if os.path.exists(out) else b"<none>"
+            failures += check(f"{name}: paste, innermost program 2004 {on}",
+                              got, b"\033[200~ready\033[201~" if on == "on"
+                              else b"ready")
+
+    # Clicks and Shift+drag in tmux: two panes side by side, two windows.
+    start(1, "echo alpha beta; sleep 60")
+    try:
+        tm = lambda *a: subprocess.run([*outer, *a], capture_output=True,
+                                       text=True).stdout.strip()
+        # The right pane writes all the time: each write clears the kernel's
+        # selection highlight, which the daemon must put back.
+        tm("split-window", "-h", "-t", "s:0",
+           "while :; do date; sleep 0.1; done")
+        tm("new-window", "-t", "s:1", "sleep 60")
+        tm("select-window", "-t", "s:0")
+        time.sleep(0.5)
+        panes = [line.split() for line in tm(
+            "list-panes", "-t", "s:0", "-F",
+            "#{pane_index} #{pane_left} #{pane_top} #{pane_width}").splitlines()]
+        right = next(p for p in panes if p[1] != "0")
+        left = next(p for p in panes if p[1] == "0")
+        # tmux is on pane 1 (the split); click pane 0.
+        before = tm("display", "-p", "#{pane_index}")
+        clicks(m, 3, 3, 1)
+        after = tm("display", "-p", "#{pane_index}")
+        failures += check("tmux: a click selects the pane", f"{before} -> {after}".encode(),
+                          f"1 -> {left[0]}".encode())
+        status_row = int(tm("display", "-p", "#{client_height}"))
+        col, row = find("1:", rows=[status_row])
+        clicks(m, col, row, 1)
+        failures += check("tmux: a click on the window list selects the window",
+                          tm("display", "-p", "#{window_index}").encode(), b"1")
+        tm("select-window", "-t", "s:0")
+        time.sleep(0.5)
+        col, row = find("alpha")
+        attr = lambda: vcsa_attr(col + 1, row)
+        plain = attr()
+        drag(m, col, row, 4)
+        lit = []
+        for _ in range(10):                     # the right pane writes at
+            time.sleep(0.13)                    # 10 Hz meanwhile
+            lit.append(attr() != plain)
+        failures += check("tmux: the highlight survives writes elsewhere "
+                          "(at least 9 of 10 samples)",
+                          str(sum(lit) >= 9).encode(), b"True")
+        clicks(m, col, row + 3, 1)              # a click clears it
+        time.sleep(0.5)
+        failures += check("tmux: a click clears the highlight",
+                          str(attr() == plain).encode(), b"True")
+        width = int(left[3])
+        border = int(right[1])                  # 0-based column of the border
+        drag(m, border, 5, -5, shift_kb=kb)
+        failures += check("tmux: Shift+drag on the border resizes the pane",
+                          tm("display", "-p", "-t", f"s:0.{left[0]}",
+                             "#{pane_width}").encode(), str(width - 5).encode())
+    finally:
+        stop()
+    return failures
 
 
 def check(name, got, expected):
