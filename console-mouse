@@ -60,7 +60,7 @@ ABS_MT_TRACKING_ID = 0x39
 BTN_LEFT, BTN_RIGHT, BTN_MIDDLE = 0x110, 0x111, 0x112
 BTN_TOOL_FINGER, BTN_TOUCH = 0x145, 0x14A
 BTN_TOOL_DOUBLETAP, BTN_TOOL_TRIPLETAP, BTN_TOOL_QUADTAP = 0x14D, 0x14E, 0x14F
-INPUT_PROP_POINTER, INPUT_PROP_DIRECT = 0x00, 0x01
+INPUT_PROP_POINTER, INPUT_PROP_DIRECT, INPUT_PROP_BUTTONPAD = 0x00, 0x01, 0x02
 KEY_LEFTCTRL, KEY_RIGHTCTRL = 29, 97
 KEY_LEFTSHIFT, KEY_RIGHTSHIFT = 42, 54
 KEY_LEFTALT = 56
@@ -132,6 +132,11 @@ class Device:
         self.pointer = pointer          # None, "rel", "touchpad", "touchscreen"
         self.keyboard = keyboard
         self.res_x, self.res_y = res[0] or 1, res[1] or 1
+        # Clickpad (the whole pad is one button): the software button area,
+        # as libinput draws it - a strip at the bottom, 10 mm or 15 % of
+        # the height whichever is smaller, whose right half is the right
+        # button. (top edge, left edge of the right button) in device units.
+        self.right_area = None
         self.reset_frame()
         # Touchpad tracking.
         self.abs_x = self.abs_y = None
@@ -190,13 +195,21 @@ def probe(path):
             return dev
         if (bit(abs_, ABS_X) and bit(abs_, ABS_Y)
                 and bit(key, BTN_TOOL_FINGER) and bit(prop, INPUT_PROP_POINTER)):
-            res = []
+            res, ranges = [], []
             for axis in (ABS_X, ABS_Y):
                 info = bytearray(24)
                 fcntl.ioctl(fd, EVIOCGABS(axis), info)
-                res.append(struct.unpack("6i", info)[5])
-            return Device(fd, path, pointer="touchpad", keyboard=keyboard,
-                          res=res)
+                _, lo, hi, _, _, r = struct.unpack("6i", info)
+                res.append(r)
+                ranges.append((lo, hi))
+            dev = Device(fd, path, pointer="touchpad", keyboard=keyboard,
+                         res=res)
+            if bit(prop, INPUT_PROP_BUTTONPAD):
+                (x0, x1), (y0, y1) = ranges
+                height_mm = (y1 - y0) / dev.res_y
+                strip_mm = min(10.0, height_mm * 0.15)
+                dev.right_area = (y1 - strip_mm * dev.res_y, x0 + (x1 - x0) / 2)
+            return dev
         if keyboard:
             return Device(fd, path, keyboard=True)
     except OSError:
@@ -772,6 +785,17 @@ class Pointer:
             + (" (bracketed)" if bracketed else ""))
 
 
+def in_right_area(dev):
+    """Is a finger on the clickpad's right software button?"""
+    if dev.right_area is None:
+        return False
+    top, left = dev.right_area
+    points = [p for s in dev.contacts if None not in (p := dev.slot_pos.get(s, [None, None]))]
+    if not points and dev.abs_x is not None:
+        points = [(dev.abs_x, dev.abs_y)]
+    return any(x >= left and y >= top for x, y in points)
+
+
 def finger_count(dev, code, value):
     counts = {BTN_TOOL_FINGER: 1, BTN_TOOL_DOUBLETAP: 2,
               BTN_TOOL_TRIPLETAP: 3, BTN_TOOL_QUADTAP: 4}
@@ -1045,10 +1069,13 @@ class Daemon:
                 btn = code
                 if dev.pointer == "touchpad":
                     dev.tap_clicked = True
-                    # A press is the button it is, however many fingers
-                    # touch: on a clickpad one finger often rests while
-                    # another moves, and a right click from a left press
-                    # opened tmux's menu. A right click is a two-finger tap.
+                    # How many fingers touch does not matter (on a clickpad
+                    # one rests while another moves, and taking two fingers
+                    # for a right click opened tmux's menu on a left press):
+                    # where the press is does. A finger in the right half of
+                    # the bottom strip makes it the right button.
+                    if value and code == BTN_LEFT and in_right_area(dev):
+                        btn = BTN_RIGHT
                 # Release what the press acted as, even if fingers changed.
                 if value:
                     dev.pressed_as[code] = btn

@@ -212,7 +212,7 @@ def clickpad_drag(cp, cells):
     cells per mm, 20 units per mm) and not scroll."""
     slot = lambda n, tid, x, y: [(EV_ABS, ABS_MT_SLOT, n), (EV_ABS, ABS_MT_TRACKING_ID, tid),
                                  (EV_ABS, ABS_MT_POSITION_X, x), (EV_ABS, ABS_MT_POSITION_Y, y)]
-    emit(cp, *slot(0, 501, 1000, 1100), (EV_ABS, ABS_X, 1000), (EV_ABS, ABS_Y, 1100),
+    emit(cp, *slot(0, 501, 1000, 700), (EV_ABS, ABS_X, 1000), (EV_ABS, ABS_Y, 700),
          (EV_KEY, BTN_TOUCH, 1), (EV_KEY, BTN_TOOL_FINGER, 1))
     emit(cp, (EV_KEY, BTN_LEFT, 1))
     x = 400
@@ -579,6 +579,26 @@ def main():
         got = run_reader("report", 2.0, clickpad_two_finger_press)
         failures += check("clickpad: a press with two fingers down is a left click",
                           got, r(0, 3, 2) + r(3, 3, 2))
+
+        def clickpad_right_area():
+            # A press in the bottom-right corner (the right software button,
+            # as libinput draws it: 65 mm pad -> bottom 9.75 mm, right half)
+            # is the right button; the same press bottom-left stays left.
+            goto(m, 4, 2)
+            for x in (1800, 300):
+                emit(cp, (EV_ABS, ABS_MT_SLOT, 0), (EV_ABS, ABS_MT_TRACKING_ID, 700 + x),
+                     (EV_ABS, ABS_MT_POSITION_X, x), (EV_ABS, ABS_MT_POSITION_Y, 1250),
+                     (EV_ABS, ABS_X, x), (EV_ABS, ABS_Y, 1250),
+                     (EV_KEY, BTN_TOUCH, 1), (EV_KEY, BTN_TOOL_FINGER, 1))
+                emit(cp, (EV_KEY, BTN_LEFT, 1))
+                emit(cp, (EV_KEY, BTN_LEFT, 0))
+                emit(cp, (EV_ABS, ABS_MT_TRACKING_ID, -1), (EV_KEY, BTN_TOOL_FINGER, 0),
+                     (EV_KEY, BTN_TOUCH, 0))
+                time.sleep(0.5)             # not a double click
+
+        got = run_reader("report", 3.0, clickpad_right_area)
+        failures += check("clickpad: bottom-right press is the right button, bottom-left the left",
+                          got, r(2, 4, 2) + r(3, 4, 2) + r(0, 4, 2) + r(3, 4, 2))
 
         def ctrl_alt():
             # Ctrl+Alt+C/V in the Latin layout, then in the Cyrillic one

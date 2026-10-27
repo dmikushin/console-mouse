@@ -68,9 +68,12 @@ click, one finger dragged drags with the left button (selects), and two
 fingers dragged scroll the content along with the fingers.
 
 Wheel sources: a mouse wheel, a TrackPoint moved with the middle button held,
-two fingers on a touchpad. Pressing a clickpad is always the left button,
-however many fingers touch it (one may rest while another drags to select);
-a right click is a two-finger tap.
+two fingers on a touchpad. A clickpad (the whole pad is one button) has the
+software buttons libinput gives it: pressing in the right half of the bottom
+strip (10 mm, or 15 % of the pad's height if that is less) is the right
+button, anywhere else the left one - however many fingers touch the pad, as
+one may rest while another drags to select. A two-finger tap is also a
+right click.
 
 Under X (the VT is in `KD_GRAPHICS`) the daemon does nothing.
 
