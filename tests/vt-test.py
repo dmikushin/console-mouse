@@ -596,6 +596,28 @@ def main():
                      (EV_KEY, BTN_TOUCH, 0))
                 time.sleep(0.5)             # not a double click
 
+        def clickpad_right_jitter():
+            # The pressing finger drifts a little (1.5 mm) while the pad is
+            # held in the right button area: no drag may be reported, the
+            # release comes at the press's cell (tmux keeps its menu open).
+            goto(m, 6, 3)
+            x, y = 1800, 1250
+            emit(cp, (EV_ABS, ABS_MT_SLOT, 0), (EV_ABS, ABS_MT_TRACKING_ID, 900),
+                 (EV_ABS, ABS_MT_POSITION_X, x), (EV_ABS, ABS_MT_POSITION_Y, y),
+                 (EV_ABS, ABS_X, x), (EV_ABS, ABS_Y, y),
+                 (EV_KEY, BTN_TOUCH, 1), (EV_KEY, BTN_TOOL_FINGER, 1))
+            emit(cp, (EV_KEY, BTN_LEFT, 1))
+            for dx in (10, 10, 10):
+                x += dx
+                emit(cp, (EV_ABS, ABS_MT_POSITION_X, x), (EV_ABS, ABS_X, x))
+            emit(cp, (EV_KEY, BTN_LEFT, 0))
+            emit(cp, (EV_ABS, ABS_MT_TRACKING_ID, -1), (EV_KEY, BTN_TOOL_FINGER, 0),
+                 (EV_KEY, BTN_TOUCH, 0))
+
+        got = run_reader("report", 2.0, clickpad_right_jitter)
+        failures += check("clickpad: a right press that drifts is a click, not a drag",
+                          got, r(2, 6, 3) + r(3, 6, 3))
+
         got = run_reader("report", 3.0, clickpad_right_area)
         failures += check("clickpad: bottom-right press is the right button, bottom-left the left",
                           got, r(2, 4, 2) + r(3, 4, 2) + r(0, 4, 2) + r(3, 4, 2))

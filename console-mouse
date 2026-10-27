@@ -438,7 +438,13 @@ def inject(fd, data):
         fcntl.ioctl(fd, TIOCSTI, bytes([byte]))
 
 
+# CONSOLE_MOUSE_DEBUG=1: log every xterm report sent to a program.
+DEBUG_REPORTS = os.environ.get("CONSOLE_MOUSE_DEBUG") == "1"
+
+
 def report(fd, code, col, row):
+    if DEBUG_REPORTS:
+        log(f"report code {code} at {col},{row}")
     inject(fd, b"\033[M" + bytes([32 + code, 32 + min(col, XTERM_MAX_CELL),
                                   32 + min(row, XTERM_MAX_CELL)]))
 
@@ -860,9 +866,17 @@ class Daemon:
             # pressed rests while another one drags, and the pointer follows
             # whichever contact moves - never scrolling, so a press-and-drag
             # selects. (ABS_X follows the first contact, the resting one.)
+            # A finger in the bottom button strip is the one pressing: as in
+            # libinput it does not move the pointer, so the jitter of a
+            # press does not turn a click into a drag (a right click that
+            # drifted a cell was taken by tmux as a drag over its menu and
+            # the release picked an item).
+            top = dev.right_area[0] if dev.right_area else None
             best = None
             for slot in dev.contacts:
                 cur, prev = dev.slot_pos.get(slot), dev.slot_prev.get(slot)
+                if top is not None and cur and cur[1] is not None and cur[1] >= top:
+                    continue
                 if cur and prev and None not in cur and None not in prev:
                     mm_x = (cur[0] - prev[0]) / dev.res_x
                     mm_y = (cur[1] - prev[1]) / dev.res_y
