@@ -116,6 +116,7 @@ DICTATION_SOCKET = "/run/user/{uid}/nerd-dictation-ex.sock"
 
 BUTTON_CODE = {BTN_LEFT: 0, BTN_MIDDLE: 1, BTN_RIGHT: 2}
 WHEEL_UP, WHEEL_DOWN, RELEASE = 64, 65, 3
+MOTION = 32                     # xterm: added to a button code for motion
 
 
 def log(*args):
@@ -442,7 +443,31 @@ def inject(fd, data):
 DEBUG_REPORTS = os.environ.get("CONSOLE_MOUSE_DEBUG") == "1"
 
 
+# Per VT fd: the last report code sent, and the last button pressed.
+LAST_REPORT = {}
+LAST_PRESS = {}
+
+
+def press(fd, code, col, row, mode):
+    """A button press, preceded in VT200 mode by a motion report to the
+    same cell. A graphical terminal reports the pointer moving there first;
+    the console cannot (the kernel keeps no any-motion mode, DECSET 1003),
+    and tmux picks a menu item by the last motion: without it, a click on an
+    item of a menu that stays open ran nothing. Only for the click after a
+    right click (the one that opened the menu) and its release: tmux reads a
+    motion report as a move only when its previous event was a release
+    (server_client_check_mouse); otherwise - after a wheel step, or in a
+    program just started that never saw our release - it takes it for the
+    start of a drag."""
+    if (mode == 2 and LAST_REPORT.get(fd) == RELEASE
+            and LAST_PRESS.get(fd) == BUTTON_CODE[BTN_RIGHT]):
+        report(fd, MOTION | RELEASE, col, row)
+    LAST_PRESS[fd] = code
+    report(fd, code, col, row)
+
+
 def report(fd, code, col, row):
+    LAST_REPORT[fd] = code
     if DEBUG_REPORTS:
         log(f"report code {code} at {col},{row}")
     inject(fd, b"\033[M" + bytes([32 + code, 32 + min(col, XTERM_MAX_CELL),
@@ -707,7 +732,7 @@ class Pointer:
         # move (decided on release) goes to the program.
         if pressed and mode and (btn != BTN_LEFT or self.shift):
             self.forwarded.add(btn)
-            report(fd, BUTTON_CODE[btn], col, row)
+            press(fd, BUTTON_CODE[btn], col, row, mode)
             return
         if not pressed:
             if btn in self.forwarded:
@@ -716,7 +741,7 @@ class Pointer:
                     report(fd, RELEASE, col, row)
             elif btn == BTN_LEFT and self.pending:
                 if mode:
-                    report(fd, BUTTON_CODE[BTN_LEFT], *self.pending)
+                    press(fd, BUTTON_CODE[BTN_LEFT], *self.pending, mode)
                     if mode == 2:
                         report(fd, RELEASE, *self.pending)
                 self.pending = None

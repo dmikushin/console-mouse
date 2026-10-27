@@ -328,6 +328,14 @@ def r(code, col, row):
     return b"\033[M" + bytes([32 + code, 32 + col, 32 + row])
 
 
+def p(code, col, row):
+    """A forwarded press right after a right click and its release, as the
+    daemon sends it in VT200 mode: a motion report to the cell first (code
+    35, how tmux learns which menu item is under the pointer), then the
+    press. Other presses are sent as they are."""
+    return r(35, col, row) + r(code, col, row)
+
+
 def daemon_module():
     import importlib.machinery
     import importlib.util
@@ -620,7 +628,7 @@ def main():
 
         got = run_reader("report", 3.0, clickpad_right_area)
         failures += check("clickpad: bottom-right press is the right button, bottom-left the left",
-                          got, r(2, 4, 2) + r(3, 4, 2) + r(0, 4, 2) + r(3, 4, 2))
+                          got, p(2, 4, 2) + r(3, 4, 2) + p(0, 4, 2) + r(3, 4, 2))
 
         def ctrl_alt():
             # Ctrl+Alt+C/V in the Latin layout, then in the Cyrillic one
@@ -699,7 +707,7 @@ def main():
                     + r(64, 4, 2) * 2                  # two-finger scroll
                     + r(0, 4, 2) + r(3, 4, 2)          # one-finger tap
                     + r(2, 4, 2) + r(3, 4, 2)          # two-finger tap
-                    + r(0, 1, 1) + r(32, 5, 1) + r(3, 5, 1)  # Shift+drag
+                    + p(0, 1, 1) + r(32, 5, 1) + r(3, 5, 1)  # Shift+drag
                     + b"HELLO")                        # drag, Alt+C/V
         failures += check("xterm reports (tmux mouse): drag selects, Shift+drag reported",
                           got, expected)
@@ -983,6 +991,23 @@ def tmux_suite(m, kb):
         failures += check("tmux: Shift+drag on the border resizes the pane",
                           tm("display", "-p", "-t", f"s:0.{left[0]}",
                              "#{pane_width}").encode(), str(width - 5).encode())
+        # A right-click menu that stays open (display-menu -O, as the user's
+        # tmux config makes it): right click opens it, it is still there
+        # after the release, and a left click on an item runs the item.
+        tm("bind", "-n", "MouseDown3Pane", "display-menu", "-O", "-t", "=",
+           "-x", "M", "-y", "M", "-T", "probe",
+           "Split here", "s", "split-window -h", "Nothing", "n", "")
+        panes_before = tm("display", "-p", "#{window_panes}")
+        goto(m, 4, 6)
+        click(m, BTN_RIGHT)
+        time.sleep(0.5)
+        col, row = find("Split here")
+        goto(m, col + 2, row)
+        click(m, BTN_LEFT)
+        time.sleep(0.8)
+        failures += check("tmux: a right click opens a menu that stays; a click on an item runs it",
+                          f"{panes_before} -> {tm('display', '-p', '#{window_panes}')}".encode(),
+                          f"{panes_before} -> {int(panes_before) + 1}".encode())
     finally:
         stop()
     return failures
