@@ -68,7 +68,9 @@ click, one finger dragged drags with the left button (selects), and two
 fingers dragged scroll the content along with the fingers.
 
 Wheel sources: a mouse wheel, a TrackPoint moved with the middle button held,
-two fingers on a touchpad. A two-finger touchpad click is a right click.
+two fingers on a touchpad. Pressing a clickpad is always the left button,
+however many fingers touch it (one may rest while another drags to select);
+a right click is a two-finger tap.
 
 Under X (the VT is in `KD_GRAPHICS`) the daemon does nothing.
 

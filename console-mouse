@@ -1045,8 +1045,10 @@ class Daemon:
                 btn = code
                 if dev.pointer == "touchpad":
                     dev.tap_clicked = True
-                    if value and code == BTN_LEFT and dev.fingers >= 2:
-                        btn = BTN_RIGHT     # two-finger press
+                    # A press is the button it is, however many fingers
+                    # touch: on a clickpad one finger often rests while
+                    # another moves, and a right click from a left press
+                    # opened tmux's menu. A right click is a two-finger tap.
                 # Release what the press acted as, even if fingers changed.
                 if value:
                     dev.pressed_as[code] = btn

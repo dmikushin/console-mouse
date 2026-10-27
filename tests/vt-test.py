@@ -562,6 +562,24 @@ def main():
         failures += check("clickpad: press with one finger, drag with another selects",
                           got, b"HELLO")
 
+        def clickpad_two_finger_press():
+            # Two fingers already touch when the pad is pressed: still the
+            # left button, so the program gets a left press, not a right one.
+            goto(m, 3, 2)
+            slot = lambda n, tid, x: [(EV_ABS, ABS_MT_SLOT, n), (EV_ABS, ABS_MT_TRACKING_ID, tid),
+                                      (EV_ABS, ABS_MT_POSITION_X, x), (EV_ABS, ABS_MT_POSITION_Y, 900)]
+            emit(cp, *slot(0, 601, 900), *slot(1, 602, 1300), (EV_ABS, ABS_X, 900),
+                 (EV_ABS, ABS_Y, 900), (EV_KEY, BTN_TOUCH, 1), (EV_KEY, BTN_TOOL_DOUBLETAP, 1))
+            emit(cp, (EV_KEY, BTN_LEFT, 1))
+            emit(cp, (EV_KEY, BTN_LEFT, 0))
+            emit(cp, (EV_ABS, ABS_MT_SLOT, 0), (EV_ABS, ABS_MT_TRACKING_ID, -1),
+                 (EV_ABS, ABS_MT_SLOT, 1), (EV_ABS, ABS_MT_TRACKING_ID, -1),
+                 (EV_KEY, BTN_TOOL_DOUBLETAP, 0), (EV_KEY, BTN_TOUCH, 0))
+
+        got = run_reader("report", 2.0, clickpad_two_finger_press)
+        failures += check("clickpad: a press with two fingers down is a left click",
+                          got, r(0, 3, 2) + r(3, 3, 2))
+
         def ctrl_alt():
             # Ctrl+Alt+C/V in the Latin layout, then in the Cyrillic one
             # (CapsLock is the AltGr lock of ruwin_cplk: C types U+0441).
