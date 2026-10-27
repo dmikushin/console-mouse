@@ -154,6 +154,7 @@ class Device:
         # Last position per slot. The kernel does not resend an unchanged
         # value, so a new contact in a slot may arrive without a position.
         self.slot_pos = {}              # slot -> [x, y]
+        self.slot_prev = {}             # touchpad: slot positions last frame
         self.gesture = None
 
     def reset_frame(self):
@@ -735,7 +736,14 @@ class Pointer:
         text, vt = self.selection
         uid = os.stat(name).st_uid
         # Not a selection a previous user of this VT left behind.
-        if text and vt == name and uid == self.selection_uid:
+        if not text:
+            log(f"copy on {name}: nothing selected")
+        elif vt != name:
+            log(f"copy on {name}: the selection is on {vt}")
+        elif uid != self.selection_uid:
+            log(f"copy on {name}: selected by uid {self.selection_uid}, "
+                f"the console is now uid {uid}")
+        else:
             self.clipboard = (text, uid)
             log(f"copied {len(text)} characters")
 
@@ -743,7 +751,12 @@ class Pointer:
         """Paste only into a console of the user the text was copied from:
         the daemon types as root into whatever VT is in front."""
         text, uid = self.clipboard
-        if not text or os.stat(name).st_uid != uid:
+        if not text:
+            log(f"paste on {name}: nothing copied")
+            return
+        if os.stat(name).st_uid != uid:
+            log(f"paste on {name}: copied by uid {uid}, the console is "
+                f"uid {os.stat(name).st_uid}")
             return
         try:
             # Unlike the other getters, this one is the ioctl's return value.
@@ -755,6 +768,8 @@ class Pointer:
         if bracketed:
             data = b"\033[200~" + data + b"\033[201~"
         inject(fd, data)
+        log(f"pasted {len(text)} characters on {name}"
+            + (" (bracketed)" if bracketed else ""))
 
 
 def finger_count(dev, code, value):
@@ -816,7 +831,25 @@ class Daemon:
 
         dcols = drows = 0.0
         steps = dev.wheel
-        if dev.pointer == "touchpad":
+        if dev.pointer == "touchpad" and dev.pressed_as:
+            # The clickpad is held down. Like libinput: the finger that
+            # pressed rests while another one drags, and the pointer follows
+            # whichever contact moves - never scrolling, so a press-and-drag
+            # selects. (ABS_X follows the first contact, the resting one.)
+            best = None
+            for slot in dev.contacts:
+                cur, prev = dev.slot_pos.get(slot), dev.slot_prev.get(slot)
+                if cur and prev and None not in cur and None not in prev:
+                    mm_x = (cur[0] - prev[0]) / dev.res_x
+                    mm_y = (cur[1] - prev[1]) / dev.res_y
+                    if best is None or math.hypot(mm_x, mm_y) > math.hypot(*best):
+                        best = (mm_x, mm_y)
+            if best:
+                dev.tap_travel += math.hypot(*best)
+                dcols, drows = best[0] * TP_COLS_PER_MM, best[1] * TP_ROWS_PER_MM
+            dev.last_x, dev.last_y = dev.abs_x, dev.abs_y
+            dev.scroll_acc = 0.0
+        elif dev.pointer == "touchpad":
             if dev.touching and dev.abs_x is not None and dev.last_x is not None:
                 mm_x = (dev.abs_x - dev.last_x) / dev.res_x
                 mm_y = (dev.abs_y - dev.last_y) / dev.res_y
@@ -844,6 +877,9 @@ class Daemon:
             pointer.scroll(con, cols, rows, steps, mode)
         for btn, pressed in dev.keys:
             pointer.button(con, cols, rows, btn, pressed, mode)
+        if dev.pointer == "touchpad":
+            dev.slot_prev = {s: list(dev.slot_pos[s]) for s in dev.contacts
+                             if s in dev.slot_pos}
         dev.reset_frame()
 
     def touchscreen(self, dev, con, cols, rows, mode):
@@ -931,9 +967,13 @@ class Daemon:
             # Ctrl+Shift, Alt or Ctrl+Alt: the voided chords
             copy = code == KEY_C
         else:
+            if ctrl or alt:
+                log(f"not a copy/paste chord: keys held {sorted(held)}")
             return
         state = self.console.state()
         if state is None:
+            log(f"{'copy' if copy else 'paste'}: {self.console.name} is not a "
+                "text console with a character keyboard (X, or a screen lock)")
             return
         if copy:
             self.pointer.copy(self.console.name)
@@ -973,6 +1013,19 @@ class Daemon:
                 else:
                     dev.contacts.add(dev.slot)
             elif code in (ABS_MT_POSITION_X, ABS_MT_POSITION_Y):
+                pos = dev.slot_pos.setdefault(dev.slot, [None, None])
+                pos[code - ABS_MT_POSITION_X] = value
+        elif type_ == EV_ABS and dev.pointer == "touchpad" and code in (
+                ABS_MT_SLOT, ABS_MT_TRACKING_ID, ABS_MT_POSITION_X, ABS_MT_POSITION_Y):
+            if code == ABS_MT_SLOT:
+                dev.slot = value
+            elif code == ABS_MT_TRACKING_ID:
+                if value < 0:
+                    dev.contacts.discard(dev.slot)
+                    dev.slot_prev.pop(dev.slot, None)
+                else:
+                    dev.contacts.add(dev.slot)
+            else:
                 pos = dev.slot_pos.setdefault(dev.slot, [None, None])
                 pos[code - ABS_MT_POSITION_X] = value
         elif type_ == EV_ABS:

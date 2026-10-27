@@ -188,6 +188,46 @@ def touchpad_setup(fd):
                     struct.pack("HH6i", axis, 0, 0, 0, maximum, 0, 0, 20))
 
 
+def clickpad_setup(fd):
+    """A clickpad with multitouch, like the Yoga 3's Synaptics TM2714:
+    INPUT_PROP_BUTTONPAD, the whole pad is the left button."""
+    for ev in (EV_KEY, EV_ABS):
+        fcntl.ioctl(fd, UI_SET_EVBIT, ev)
+    for b in (BTN_LEFT, BTN_TOOL_FINGER, BTN_TOUCH, BTN_TOOL_DOUBLETAP):
+        fcntl.ioctl(fd, UI_SET_KEYBIT, b)
+    fcntl.ioctl(fd, UI_SET_PROPBIT, 0)      # INPUT_PROP_POINTER
+    fcntl.ioctl(fd, UI_SET_PROPBIT, 2)      # INPUT_PROP_BUTTONPAD
+    for axis, maximum in ((ABS_X, 2000), (ABS_Y, 1300), (ABS_MT_SLOT, 4),
+                          (ABS_MT_TRACKING_ID, 65535),
+                          (ABS_MT_POSITION_X, 2000), (ABS_MT_POSITION_Y, 1300)):
+        fcntl.ioctl(fd, UI_SET_ABSBIT, axis)
+        res = 0 if axis in (ABS_MT_SLOT, ABS_MT_TRACKING_ID) else 20
+        fcntl.ioctl(fd, UI_ABS_SETUP,
+                    struct.pack("HH6i", axis, 0, 0, 0, maximum, 0, 0, res))
+
+
+def clickpad_drag(cp, cells):
+    """Press the pad with one finger and drag with a second one, as people
+    select on a clickpad: the pointer must follow the moving finger (1.4
+    cells per mm, 20 units per mm) and not scroll."""
+    slot = lambda n, tid, x, y: [(EV_ABS, ABS_MT_SLOT, n), (EV_ABS, ABS_MT_TRACKING_ID, tid),
+                                 (EV_ABS, ABS_MT_POSITION_X, x), (EV_ABS, ABS_MT_POSITION_Y, y)]
+    emit(cp, *slot(0, 501, 1000, 1100), (EV_ABS, ABS_X, 1000), (EV_ABS, ABS_Y, 1100),
+         (EV_KEY, BTN_TOUCH, 1), (EV_KEY, BTN_TOOL_FINGER, 1))
+    emit(cp, (EV_KEY, BTN_LEFT, 1))
+    x = 400
+    emit(cp, *slot(1, 502, x, 600), (EV_KEY, BTN_TOOL_FINGER, 0),
+         (EV_KEY, BTN_TOOL_DOUBLETAP, 1))
+    units = round(cells / 1.4 * 20)
+    for step in range(4):
+        x += units // 4
+        emit(cp, (EV_ABS, ABS_MT_SLOT, 1), (EV_ABS, ABS_MT_POSITION_X, x))
+    emit(cp, (EV_KEY, BTN_LEFT, 0))
+    emit(cp, (EV_ABS, ABS_MT_SLOT, 1), (EV_ABS, ABS_MT_TRACKING_ID, -1),
+         (EV_ABS, ABS_MT_SLOT, 0), (EV_ABS, ABS_MT_TRACKING_ID, -1),
+         (EV_KEY, BTN_TOOL_DOUBLETAP, 0), (EV_KEY, BTN_TOUCH, 0))
+
+
 def emit(fd, *events):
     for type_, code, value in events:
         os.write(fd, EVENT.pack(0, 0, type_, code, value))
@@ -481,6 +521,7 @@ def main():
     keymap_before = keymap_entries()
     m = uinput("console-mouse test mouse", mouse_setup)
     tp = uinput("console-mouse test touchpad", touchpad_setup)
+    cp = uinput("console-mouse test clickpad", clickpad_setup)
     ts = uinput("console-mouse test touchscreen", touchscreen_setup)
     kb = uinput("console-mouse test keyboard", keyboard_setup)
     commands, close_dictation = fake_dictation()
@@ -510,6 +551,16 @@ def main():
         got = run_reader("plain", 3.5, copy_paste)
         failures += check("select + Ctrl+Shift+C/V, Alt+C/V",
                           got, b"HELLOWORLDWORLD")
+
+        def clickpad():
+            goto(m, 1, 1)
+            clickpad_drag(cp, 4.2)               # cells 1..5: "HELLO"
+            chord(kb, KEY_LEFTCTRL, KEY_LEFTSHIFT, KEY_C)
+            chord(kb, KEY_LEFTCTRL, KEY_LEFTSHIFT, KEY_V)
+
+        got = run_reader("plain", 3.0, clickpad)
+        failures += check("clickpad: press with one finger, drag with another selects",
+                          got, b"HELLO")
 
         def ctrl_alt():
             # Ctrl+Alt+C/V in the Latin layout, then in the Cyrillic one
@@ -606,7 +657,7 @@ def main():
                           str(keymap_before).encode())
         failures += keymap_crash()
         subprocess.run(["chvt", original])
-        for fd in (m, tp, kb, ts):
+        for fd in (m, tp, cp, kb, ts):
             fcntl.ioctl(fd, UI_DEV_DESTROY)
         close_dictation()
         if service:
