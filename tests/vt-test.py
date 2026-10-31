@@ -21,6 +21,7 @@ mouse, touchpad and keyboard through uinput, and checks what arrives:
   5. the console keymap is restored when the daemon stops.
 Then switches back to the original VT.
 """
+import atexit
 import fcntl
 import glob
 import json
@@ -524,6 +525,9 @@ def main():
                               "console-mouse"]).returncode == 0
     if service:
         subprocess.run(["systemctl", "stop", "console-mouse"], check=True)
+        # Whatever stops the test from here on (a missing /dev/uinput, an
+        # exception in a case): the installed daemon comes back.
+        atexit.register(subprocess.run, ["systemctl", "start", "console-mouse"])
     # Before any VT switch: with X in front, as on a laptop running i3.
     unicode_failures = unicode_keymap_test()
     keymap_before = keymap_entries()
@@ -728,8 +732,6 @@ def main():
         for fd in (m, tp, cp, kb, ts):
             fcntl.ioctl(fd, UI_DEV_DESTROY)
         close_dictation()
-        if service:
-            subprocess.run(["systemctl", "start", "console-mouse"])
     sys.exit(1 if failures else 0)
 
 
